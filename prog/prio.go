@@ -1,4 +1,4 @@
-// Copyright 2015 syzkaller project authors. All rights reserved.
+// Copyright 2015/2016 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 package prog
@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
-	"sync"
 
 	"github.com/google/syzkaller/sys"
 )
@@ -28,7 +27,7 @@ import (
 // constants.
 
 func CalculatePriorities(corpus []*Prog) [][]float32 {
-	static := getStaticPrio()
+	static := calcStaticPriorities()
 	dynamic := calcDynamicPrio(corpus)
 	for i, prios := range static {
 		for j, p := range prios {
@@ -36,18 +35,6 @@ func CalculatePriorities(corpus []*Prog) [][]float32 {
 		}
 	}
 	return dynamic
-}
-
-var (
-	staticOnce sync.Once
-	staticPrio [][]float32
-)
-
-func getStaticPrio() [][]float32 {
-	staticOnce.Do(func() {
-		staticPrio = calcStaticPriorities()
-	})
-	return staticPrio
 }
 
 func calcStaticPriorities() [][]float32 {
@@ -63,44 +50,53 @@ func calcStaticPriorities() [][]float32 {
 				uses[id][c.ID] = weight
 			}
 		}
-		foreachArgType(c, func(t sys.Type, d ArgDir) {
+		sys.ForeachType(c, func(t sys.Type) {
 			switch a := t.(type) {
-			case sys.ResourceType:
-				if a.Kind == sys.ResPid || a.Kind == sys.ResUid || a.Kind == sys.ResGid {
+			case *sys.ResourceType:
+				if a.Desc.Name == "pid" || a.Desc.Name == "uid" || a.Desc.Name == "gid" {
 					// Pid/uid/gid usually play auxiliary role,
 					// but massively happen in some structs.
-					noteUsage(0.1, "res%v", a.Kind)
-				} else if a.Subkind == sys.ResAny {
-					noteUsage(1.0, "res%v", a.Kind)
+					noteUsage(0.1, "res%v", a.Desc.Name)
 				} else {
-					noteUsage(0.2, "res%v", a.Kind)
-					noteUsage(1.0, "res%v-%v", a.Kind, a.Subkind)
+					str := "res"
+					for i, k := range a.Desc.Kind {
+						str += "-" + k
+						w := 1.0
+						if i < len(a.Desc.Kind)-1 {
+							w = 0.2
+						}
+						noteUsage(float32(w), str)
+					}
 				}
-			case sys.PtrType:
-				if _, ok := a.Type.(sys.StructType); ok {
+			case *sys.PtrType:
+				if _, ok := a.Type.(*sys.StructType); ok {
 					noteUsage(1.0, "ptrto-%v", a.Type.Name())
 				}
-			case sys.BufferType:
+				if _, ok := a.Type.(*sys.UnionType); ok {
+					noteUsage(1.0, "ptrto-%v", a.Type.Name())
+				}
+				if arr, ok := a.Type.(*sys.ArrayType); ok {
+					noteUsage(1.0, "ptrto-%v", arr.Type.Name())
+				}
+			case *sys.BufferType:
 				switch a.Kind {
-				case sys.BufferBlob, sys.BufferFilesystem:
+				case sys.BufferBlobRand, sys.BufferBlobRange, sys.BufferText:
 				case sys.BufferString:
-					noteUsage(0.2, "str")
-				case sys.BufferSockaddr:
-					noteUsage(1.0, "sockaddr")
+					if a.SubKind != "" {
+						noteUsage(0.2, fmt.Sprintf("str-%v", a.SubKind))
+					}
+				case sys.BufferFilename:
+					noteUsage(1.0, "filename")
 				default:
 					panic("unknown buffer kind")
 				}
-			case sys.VmaType:
+			case *sys.VmaType:
 				noteUsage(0.5, "vma")
-			case sys.FilenameType:
-				noteUsage(1.0, "filename")
-			case sys.IntType:
+			case *sys.IntType:
 				switch a.Kind {
-				case sys.IntPlain:
+				case sys.IntPlain, sys.IntFileoff, sys.IntRange:
 				case sys.IntSignalno:
 					noteUsage(1.0, "signalno")
-				case sys.IntInaddr:
-					noteUsage(1.0, "inaddr")
 				default:
 					panic("unknown int kind")
 				}
@@ -122,6 +118,7 @@ func calcStaticPriorities() [][]float32 {
 			}
 		}
 	}
+
 	// Self-priority (call wrt itself) is assigned to the maximum priority
 	// this call has wrt other calls. This way the priority is high, but not too high.
 	for c0, pp := range prios {
@@ -194,59 +191,34 @@ func normalizePrio(prios [][]float32) {
 	}
 }
 
-func foreachArgType(meta *sys.Call, f func(sys.Type, ArgDir)) {
-	var rec func(t sys.Type, dir ArgDir)
-	rec = func(t sys.Type, d ArgDir) {
-		f(t, d)
-		switch a := t.(type) {
-		case sys.ArrayType:
-			rec(a.Type, d)
-		case sys.PtrType:
-			rec(a.Type, ArgDir(a.Dir))
-		case sys.StructType:
-			for _, f := range a.Fields {
-				rec(f, d)
-			}
-		case sys.ResourceType, sys.FileoffType, sys.BufferType,
-			sys.VmaType, sys.LenType, sys.FlagsType, sys.ConstType,
-			sys.StrConstType, sys.IntType, sys.FilenameType:
-		default:
-			panic("unknown type")
-		}
-	}
-	for _, t := range meta.Args {
-		rec(t, DirIn)
-	}
-	if meta.Ret != nil {
-		rec(meta.Ret, DirOut)
-	}
-}
-
 // ChooseTable allows to do a weighted choice of a syscall for a given syscall
 // based on call-to-call priorities and a set of enabled syscalls.
 type ChoiceTable struct {
 	run          [][]int
 	enabledCalls []*sys.Call
-	enabled      map[int]bool
+	enabled      map[*sys.Call]bool
 }
 
-func BuildChoiceTable(prios [][]float32, enabledCalls []*sys.Call) *ChoiceTable {
-	if len(enabledCalls) == 0 {
-		enabledCalls = sys.Calls
+func BuildChoiceTable(prios [][]float32, enabled map[*sys.Call]bool) *ChoiceTable {
+	if enabled == nil {
+		enabled = make(map[*sys.Call]bool)
+		for _, c := range sys.Calls {
+			enabled[c] = true
+		}
 	}
-	enabled := make(map[int]bool)
-	for _, c := range enabledCalls {
-		enabled[c.ID] = true
+	var enabledCalls []*sys.Call
+	for c := range enabled {
+		enabledCalls = append(enabledCalls, c)
 	}
 	run := make([][]int, len(sys.Calls))
 	for i := range run {
-		if !enabled[i] {
+		if !enabled[sys.Calls[i]] {
 			continue
 		}
 		run[i] = make([]int, len(sys.Calls))
 		sum := 0
 		for j := range run[i] {
-			if enabled[j] {
+			if enabled[sys.Calls[j]] {
 				sum += int(prios[i][j] * 1000)
 			}
 			run[i][j] = sum
@@ -269,7 +241,7 @@ func (ct *ChoiceTable) Choose(r *rand.Rand, call int) int {
 	for {
 		x := r.Intn(run[len(run)-1])
 		i := sort.SearchInts(run, x)
-		if !ct.enabled[i] {
+		if !ct.enabled[sys.Calls[i]] {
 			continue
 		}
 		return i

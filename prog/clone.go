@@ -15,8 +15,10 @@ func (p *Prog) Clone() *Prog {
 		}
 		p1.Calls = append(p1.Calls, c1)
 	}
-	if err := p1.validate(); err != nil {
-		panic(err)
+	if debug {
+		if err := p1.validate(); err != nil {
+			panic(err)
+		}
 	}
 	return p1
 }
@@ -24,13 +26,14 @@ func (p *Prog) Clone() *Prog {
 func (arg *Arg) clone(c *Call, newargs map[*Arg]*Arg) *Arg {
 	arg1 := new(Arg)
 	*arg1 = *arg
-	arg1.Call = c
 	arg1.Data = append([]byte{}, arg.Data...)
 	switch arg.Kind {
 	case ArgPointer:
 		if arg.Res != nil {
 			arg1.Res = arg.Res.clone(c, newargs)
 		}
+	case ArgUnion:
+		arg1.Option = arg.Option.clone(c, newargs)
 	case ArgResult:
 		r := newargs[arg.Res]
 		arg1.Res = r
@@ -43,7 +46,9 @@ func (arg *Arg) clone(c *Call, newargs map[*Arg]*Arg) *Arg {
 	for _, arg2 := range arg.Inner {
 		arg1.Inner = append(arg1.Inner, arg2.clone(c, newargs))
 	}
-	arg1.Uses = nil // filled when we clone the referent
-	newargs[arg] = arg1
+	if len(arg1.Uses) != 0 {
+		arg1.Uses = nil // filled when we clone the referent
+		newargs[arg] = arg1
+	}
 	return arg1
 }

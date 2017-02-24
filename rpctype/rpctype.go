@@ -9,50 +9,66 @@ type RpcInput struct {
 	Call      string
 	Prog      []byte
 	CallIndex int
+	Signal    []uint32
 	Cover     []uint32
 }
 
-type MasterConnectArgs struct {
-	Name string
-	Http string
+type RpcCandidate struct {
+	Prog      []byte
+	Minimized bool
 }
 
-type MasterConnectRes struct {
-	Http string
-}
-
-type NewMasterInputArgs struct {
-	Name string
-	Prog []byte
-}
-
-type MasterPollArgs struct {
+type ConnectArgs struct {
 	Name string
 }
 
-type MasterPollRes struct {
-	Inputs [][]byte
+type ConnectRes struct {
+	Prios        [][]float32
+	Inputs       []RpcInput
+	MaxSignal    []uint32
+	Candidates   []RpcCandidate
+	EnabledCalls string
+	NeedCheck    bool
 }
 
-type ManagerConnectArgs struct {
-	Name string
+type CheckArgs struct {
+	Name  string
+	Kcov  bool
+	Calls []string
 }
 
-type ManagerConnectRes struct {
-	Prios [][]float32
-}
-
-type NewManagerInputArgs struct {
+type NewInputArgs struct {
 	Name string
 	RpcInput
 }
 
-type ManagerPollArgs struct {
-	Name  string
-	Stats map[string]uint64
+type PollArgs struct {
+	Name      string
+	MaxSignal []uint32
+	Stats     map[string]uint64
 }
 
-type ManagerPollRes struct {
-	Candidates [][]byte
+type PollRes struct {
+	Candidates []RpcCandidate
 	NewInputs  []RpcInput
+	MaxSignal  []uint32
+}
+
+type HubConnectArgs struct {
+	Name   string
+	Key    string
+	Fresh  bool
+	Calls  []string
+	Corpus [][]byte
+}
+
+type HubSyncArgs struct {
+	Name string
+	Key  string
+	Add  [][]byte
+	Del  []string
+}
+
+type HubSyncRes struct {
+	Inputs [][]byte
 }
