@@ -8,10 +8,14 @@ import (
 )
 
 func TestParseSingle(t *testing.T) {
+	target, err := GetTarget("linux", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
 	const execLog = `getpid()
 gettid()	
 `
-	entries := ParseLog([]byte(execLog))
+	entries := target.ParseLog([]byte(execLog))
 	if len(entries) != 1 {
 		t.Fatalf("got %v programs, want 1", len(entries))
 	}
@@ -25,6 +29,9 @@ gettid()
 	if ent.Proc != 0 {
 		t.Fatalf("proc %v, want 0", ent.Proc)
 	}
+	if ent.Fault || ent.FaultCall != 0 || ent.FaultNth != 0 {
+		t.Fatalf("fault injection enabled")
+	}
 	want := "getpid-gettid"
 	got := ent.P.String()
 	if got != want {
@@ -33,7 +40,11 @@ gettid()
 }
 
 func TestParseMulti(t *testing.T) {
-	entries := ParseLog([]byte(execLog))
+	target, err := GetTarget("linux", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := target.ParseLog([]byte(execLog))
 	if len(entries) != 5 {
 		for i, ent := range entries {
 			t.Logf("program #%v: %s\n", i, ent.P)
@@ -52,6 +63,11 @@ func TestParseMulti(t *testing.T) {
 		entries[3].Proc != 33 ||
 		entries[4].Proc != 9 {
 		t.Fatalf("bad procs")
+	}
+	for i, ent := range entries {
+		if ent.Fault || ent.FaultCall != 0 || ent.FaultNth != 0 {
+			t.Fatalf("prog %v has fault injection enabled", i)
+		}
 	}
 	if s := entries[0].P.String(); s != "getpid-gettid" {
 		t.Fatalf("bad program 0: %s", s)
@@ -89,3 +105,33 @@ getpid()
 2015/12/21 12:18:05 executing program 9:
 munlockall()
 `
+
+func TestParseFault(t *testing.T) {
+	target, err := GetTarget("linux", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const execLog = `2015/12/21 12:18:05 executing program 1 (fault-call:1 fault-nth:55):
+gettid()
+getpid()
+`
+	entries := target.ParseLog([]byte(execLog))
+	if len(entries) != 1 {
+		t.Fatalf("got %v programs, want 1", len(entries))
+	}
+	ent := entries[0]
+	if !ent.Fault {
+		t.Fatalf("fault injection is not enabled")
+	}
+	if ent.FaultCall != 1 {
+		t.Fatalf("fault call: got %v, want 1", ent.FaultCall)
+	}
+	if ent.FaultNth != 55 {
+		t.Fatalf("fault nth: got %v, want 55", ent.FaultNth)
+	}
+	want := "gettid-getpid"
+	got := ent.P.String()
+	if got != want {
+		t.Fatalf("bad program: %s, want %s", got, want)
+	}
+}

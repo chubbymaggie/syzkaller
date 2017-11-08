@@ -8,13 +8,16 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"path/filepath"
+	"runtime"
 
-	"github.com/google/syzkaller/report"
+	"github.com/google/syzkaller/pkg/report"
 )
 
 var (
-	flagLinux = flag.String("linux", "", "path to linux")
+	flagOS        = flag.String("os", runtime.GOOS, "target os")
+	flagKernelSrc = flag.String("kernel_src", "", "path to kernel sources")
+	flagKernelObj = flag.String("kernel_obj", "", "path to kernel build/obj dir")
+	flagReport    = flag.Bool("report", false, "extract report from the log")
 )
 
 func main() {
@@ -24,18 +27,45 @@ func main() {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
+	reporter, err := report.NewReporter(*flagOS, *flagKernelSrc, *flagKernelObj, nil, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create reporter: %v\n", err)
+		os.Exit(1)
+	}
 	text, err := ioutil.ReadFile(flag.Args()[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open input file: %v\n", err)
 		os.Exit(1)
 	}
-	if _, parsed, _, _ := report.Parse(text, nil); len(parsed) != 0 {
-		text = parsed
+	if *flagReport {
+		desc, text, _, _ := reporter.Parse(text)
+		text, err = reporter.Symbolize(text)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to symbolize: %v\n", err)
+			os.Exit(1)
+		}
+		guiltyFile := reporter.ExtractGuiltyFile(text)
+		fmt.Printf("%v\n\n", desc)
+		os.Stdout.Write(text)
+		fmt.Printf("\n")
+		fmt.Printf("guilty file: %v\n", guiltyFile)
+		if guiltyFile != "" {
+			maintainers, err := reporter.GetMaintainers(guiltyFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to get maintainers: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("maintainers: %v\n", maintainers)
+		}
+	} else {
+		if console := reporter.ExtractConsoleOutput(text); len(console) != 0 {
+			text = console
+		}
+		text, err = reporter.Symbolize(text)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to symbolize: %v\n", err)
+			os.Exit(1)
+		}
+		os.Stdout.Write(text)
 	}
-	text, err = report.Symbolize(filepath.Join(*flagLinux, "vmlinux"), text)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to symbolize: %v\n", err)
-		os.Exit(1)
-	}
-	os.Stdout.Write(text)
 }

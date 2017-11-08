@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"io"
 	"strconv"
-
-	"github.com/google/syzkaller/sys"
 )
 
 // String generates a very compact program description (mostly for debug output).
@@ -33,43 +31,80 @@ func (p *Prog) Serialize() []byte {
 		}
 	}
 	buf := new(bytes.Buffer)
-	vars := make(map[*Arg]int)
+	vars := make(map[Arg]int)
 	varSeq := 0
 	for _, c := range p.Calls {
-		if len(c.Ret.Uses) != 0 {
+		if len(*c.Ret.(ArgUsed).Used()) != 0 {
 			fmt.Fprintf(buf, "r%v = ", varSeq)
 			vars[c.Ret] = varSeq
 			varSeq++
 		}
 		fmt.Fprintf(buf, "%v(", c.Meta.Name)
 		for i, a := range c.Args {
-			if sys.IsPad(a.Type) {
+			if IsPad(a.Type()) {
 				continue
 			}
 			if i != 0 {
 				fmt.Fprintf(buf, ", ")
 			}
-			a.serialize(buf, vars, &varSeq)
+			serialize(a, buf, vars, &varSeq)
 		}
 		fmt.Fprintf(buf, ")\n")
 	}
 	return buf.Bytes()
 }
 
-func (a *Arg) serialize(buf io.Writer, vars map[*Arg]int, varSeq *int) {
-	if a == nil {
+func serialize(arg Arg, buf io.Writer, vars map[Arg]int, varSeq *int) {
+	if arg == nil {
 		fmt.Fprintf(buf, "nil")
 		return
 	}
-	if len(a.Uses) != 0 {
+	if used, ok := arg.(ArgUsed); ok && len(*used.Used()) != 0 {
 		fmt.Fprintf(buf, "<r%v=>", *varSeq)
-		vars[a] = *varSeq
+		vars[arg] = *varSeq
 		*varSeq++
 	}
-	switch a.Kind {
-	case ArgConst:
+	switch a := arg.(type) {
+	case *ConstArg:
 		fmt.Fprintf(buf, "0x%x", a.Val)
-	case ArgResult:
+	case *PointerArg:
+		if a.Res == nil && a.PagesNum == 0 {
+			fmt.Fprintf(buf, "0x0")
+			break
+		}
+		fmt.Fprintf(buf, "&%v=", serializeAddr(arg))
+		serialize(a.Res, buf, vars, varSeq)
+	case *DataArg:
+		fmt.Fprintf(buf, "\"%v\"", hex.EncodeToString(a.Data))
+	case *GroupArg:
+		var delims []byte
+		switch arg.Type().(type) {
+		case *StructType:
+			delims = []byte{'{', '}'}
+		case *ArrayType:
+			delims = []byte{'[', ']'}
+		default:
+			panic("unknown group type")
+		}
+		buf.Write([]byte{delims[0]})
+		for i, arg1 := range a.Inner {
+			if arg1 != nil && IsPad(arg1.Type()) {
+				continue
+			}
+			if i != 0 {
+				fmt.Fprintf(buf, ", ")
+			}
+			serialize(arg1, buf, vars, varSeq)
+		}
+		buf.Write([]byte{delims[1]})
+	case *UnionArg:
+		fmt.Fprintf(buf, "@%v=", a.OptionType.FieldName())
+		serialize(a.Option, buf, vars, varSeq)
+	case *ResultArg:
+		if a.Res == nil {
+			fmt.Fprintf(buf, "0x%x", a.Val)
+			break
+		}
 		id, ok := vars[a.Res]
 		if !ok {
 			panic("no result")
@@ -81,47 +116,18 @@ func (a *Arg) serialize(buf io.Writer, vars map[*Arg]int, varSeq *int) {
 		if a.OpAdd != 0 {
 			fmt.Fprintf(buf, "+%v", a.OpAdd)
 		}
-	case ArgPointer:
-		fmt.Fprintf(buf, "&%v=", serializeAddr(a, true))
-		a.Res.serialize(buf, vars, varSeq)
-	case ArgPageSize:
-		fmt.Fprintf(buf, "%v", serializeAddr(a, false))
-	case ArgData:
-		fmt.Fprintf(buf, "\"%v\"", hex.EncodeToString(a.Data))
-	case ArgGroup:
-		var delims []byte
-		switch a.Type.(type) {
-		case *sys.StructType:
-			delims = []byte{'{', '}'}
-		case *sys.ArrayType:
-			delims = []byte{'[', ']'}
-		default:
-			panic("unknown group type")
-		}
-		buf.Write([]byte{delims[0]})
-		for i, a1 := range a.Inner {
-			if a1 != nil && sys.IsPad(a1.Type) {
-				continue
-			}
-			if i != 0 {
-				fmt.Fprintf(buf, ", ")
-			}
-			a1.serialize(buf, vars, varSeq)
-		}
-		buf.Write([]byte{delims[1]})
-	case ArgUnion:
-		fmt.Fprintf(buf, "@%v=", a.OptionType.FieldName())
-		a.Option.serialize(buf, vars, varSeq)
 	default:
 		panic("unknown arg kind")
 	}
 }
 
-func Deserialize(data []byte) (prog *Prog, err error) {
-	prog = new(Prog)
+func (target *Target) Deserialize(data []byte) (prog *Prog, err error) {
+	prog = &Prog{
+		Target: target,
+	}
 	p := &parser{r: bufio.NewScanner(bytes.NewReader(data))}
 	p.r.Buffer(nil, maxLineLen)
-	vars := make(map[string]*Arg)
+	vars := make(map[string]Arg)
 	for p.Scan() {
 		if p.EOF() || p.Char() == '#' {
 			continue
@@ -134,13 +140,13 @@ func Deserialize(data []byte) (prog *Prog, err error) {
 			name = p.Ident()
 
 		}
-		meta := sys.CallMap[name]
+		meta := target.SyscallMap[name]
 		if meta == nil {
 			return nil, fmt.Errorf("unknown syscall %v", name)
 		}
 		c := &Call{
 			Meta: meta,
-			Ret:  returnArg(meta.Ret),
+			Ret:  MakeReturnArg(meta.Ret),
 		}
 		prog.Calls = append(prog.Calls, c)
 		p.Parse('(')
@@ -149,10 +155,10 @@ func Deserialize(data []byte) (prog *Prog, err error) {
 				return nil, fmt.Errorf("wrong call arg count: %v, want %v", i+1, len(meta.Args))
 			}
 			typ := meta.Args[i]
-			if sys.IsPad(typ) {
+			if IsPad(typ) {
 				return nil, fmt.Errorf("padding in syscall %v arguments", name)
 			}
-			arg, err := parseArg(typ, p, vars)
+			arg, err := target.parseArg(typ, p, vars)
 			if err != nil {
 				return nil, err
 			}
@@ -164,6 +170,11 @@ func Deserialize(data []byte) (prog *Prog, err error) {
 		p.Parse(')')
 		if !p.EOF() {
 			return nil, fmt.Errorf("tailing data (line #%v)", p.l)
+		}
+		if len(c.Args) < len(meta.Args) {
+			for i := len(c.Args); i < len(meta.Args); i++ {
+				c.Args = append(c.Args, defaultArg(meta.Args[i]))
+			}
 		}
 		if len(c.Args) != len(meta.Args) {
 			return nil, fmt.Errorf("wrong call arg count: %v, want %v", len(c.Args), len(meta.Args))
@@ -184,7 +195,7 @@ func Deserialize(data []byte) (prog *Prog, err error) {
 	return
 }
 
-func parseArg(typ sys.Type, p *parser, vars map[string]*Arg) (*Arg, error) {
+func (target *Target) parseArg(typ Type, p *parser, vars map[string]Arg) (Arg, error) {
 	r := ""
 	if p.Char() == '<' {
 		p.Parse('<')
@@ -192,7 +203,7 @@ func parseArg(typ sys.Type, p *parser, vars map[string]*Arg) (*Arg, error) {
 		p.Parse('=')
 		p.Parse('>')
 	}
-	var arg *Arg
+	var arg Arg
 	switch p.Char() {
 	case '0':
 		val := p.Ident()
@@ -200,14 +211,25 @@ func parseArg(typ sys.Type, p *parser, vars map[string]*Arg) (*Arg, error) {
 		if err != nil {
 			return nil, fmt.Errorf("wrong arg value '%v': %v", val, err)
 		}
-		arg = constArg(typ, uintptr(v))
+		switch typ.(type) {
+		case *ConstType, *IntType, *FlagsType, *ProcType, *LenType, *CsumType:
+			arg = MakeConstArg(typ, v)
+		case *ResourceType:
+			arg = MakeResultArg(typ, nil, v)
+		case *PtrType:
+			arg = MakePointerArg(typ, 0, 0, 0, nil)
+		case *VmaType:
+			arg = MakePointerArg(typ, 0, 0, 0, nil)
+		default:
+			return nil, fmt.Errorf("bad const type %+v", typ)
+		}
 	case 'r':
 		id := p.Ident()
 		v, ok := vars[id]
 		if !ok || v == nil {
 			return nil, fmt.Errorf("result %v references unknown variable (vars=%+v)", id, vars)
 		}
-		arg = resultArg(typ, v)
+		arg = MakeResultArg(typ, v, 0)
 		if p.Char() == '/' {
 			p.Parse('/')
 			op := p.Ident()
@@ -215,7 +237,7 @@ func parseArg(typ sys.Type, p *parser, vars map[string]*Arg) (*Arg, error) {
 			if err != nil {
 				return nil, fmt.Errorf("wrong result div op: '%v'", op)
 			}
-			arg.OpDiv = uintptr(v)
+			arg.(*ResultArg).OpDiv = v
 		}
 		if p.Char() == '+' {
 			p.Parse('+')
@@ -224,14 +246,14 @@ func parseArg(typ sys.Type, p *parser, vars map[string]*Arg) (*Arg, error) {
 			if err != nil {
 				return nil, fmt.Errorf("wrong result add op: '%v'", op)
 			}
-			arg.OpAdd = uintptr(v)
+			arg.(*ResultArg).OpAdd = v
 		}
 	case '&':
-		var typ1 sys.Type
+		var typ1 Type
 		switch t1 := typ.(type) {
-		case *sys.PtrType:
+		case *PtrType:
 			typ1 = t1.Type
-		case *sys.VmaType:
+		case *VmaType:
 		default:
 			return nil, fmt.Errorf("& arg is not a pointer: %#v", typ)
 		}
@@ -241,17 +263,19 @@ func parseArg(typ sys.Type, p *parser, vars map[string]*Arg) (*Arg, error) {
 			return nil, err
 		}
 		p.Parse('=')
-		inner, err := parseArg(typ1, p, vars)
+		inner, err := target.parseArg(typ1, p, vars)
 		if err != nil {
 			return nil, err
 		}
-		arg = pointerArg(typ, page, off, size, inner)
+		arg = MakePointerArg(typ, page, off, size, inner)
 	case '(':
-		page, off, _, err := parseAddr(p, false)
+		// This used to parse length of VmaType and return ArgPageSize, which is now removed.
+		// Leaving this for now for backwards compatibility.
+		pages, _, _, err := parseAddr(p, false)
 		if err != nil {
 			return nil, err
 		}
-		arg = pageSizeArg(typ, page, off)
+		arg = MakeConstArg(typ, pages*target.PageSize)
 	case '"':
 		p.Parse('"')
 		val := ""
@@ -265,21 +289,21 @@ func parseArg(typ sys.Type, p *parser, vars map[string]*Arg) (*Arg, error) {
 		}
 		arg = dataArg(typ, data)
 	case '{':
-		t1, ok := typ.(*sys.StructType)
+		t1, ok := typ.(*StructType)
 		if !ok {
 			return nil, fmt.Errorf("'{' arg is not a struct: %#v", typ)
 		}
 		p.Parse('{')
-		var inner []*Arg
+		var inner []Arg
 		for i := 0; p.Char() != '}'; i++ {
 			if i >= len(t1.Fields) {
 				return nil, fmt.Errorf("wrong struct arg count: %v, want %v", i+1, len(t1.Fields))
 			}
 			fld := t1.Fields[i]
-			if sys.IsPad(fld) {
-				inner = append(inner, constArg(fld, 0))
+			if IsPad(fld) {
+				inner = append(inner, MakeConstArg(fld, 0))
 			} else {
-				arg, err := parseArg(fld, p, vars)
+				arg, err := target.parseArg(fld, p, vars)
 				if err != nil {
 					return nil, err
 				}
@@ -290,19 +314,19 @@ func parseArg(typ sys.Type, p *parser, vars map[string]*Arg) (*Arg, error) {
 			}
 		}
 		p.Parse('}')
-		if last := t1.Fields[len(t1.Fields)-1]; sys.IsPad(last) {
-			inner = append(inner, constArg(last, 0))
+		for len(inner) < len(t1.Fields) {
+			inner = append(inner, defaultArg(t1.Fields[len(inner)]))
 		}
-		arg = groupArg(typ, inner)
+		arg = MakeGroupArg(typ, inner)
 	case '[':
-		t1, ok := typ.(*sys.ArrayType)
+		t1, ok := typ.(*ArrayType)
 		if !ok {
 			return nil, fmt.Errorf("'[' arg is not an array: %#v", typ)
 		}
 		p.Parse('[')
-		var inner []*Arg
+		var inner []Arg
 		for i := 0; p.Char() != ']'; i++ {
-			arg, err := parseArg(t1.Type, p, vars)
+			arg, err := target.parseArg(t1.Type, p, vars)
 			if err != nil {
 				return nil, err
 			}
@@ -312,17 +336,17 @@ func parseArg(typ sys.Type, p *parser, vars map[string]*Arg) (*Arg, error) {
 			}
 		}
 		p.Parse(']')
-		arg = groupArg(typ, inner)
+		arg = MakeGroupArg(typ, inner)
 	case '@':
-		t1, ok := typ.(*sys.UnionType)
+		t1, ok := typ.(*UnionType)
 		if !ok {
 			return nil, fmt.Errorf("'@' arg is not a union: %#v", typ)
 		}
 		p.Parse('@')
 		name := p.Ident()
 		p.Parse('=')
-		var optType sys.Type
-		for _, t2 := range t1.Options {
+		var optType Type
+		for _, t2 := range t1.Fields {
 			if name == t2.FieldName() {
 				optType = t2
 				break
@@ -331,7 +355,7 @@ func parseArg(typ sys.Type, p *parser, vars map[string]*Arg) (*Arg, error) {
 		if optType == nil {
 			return nil, fmt.Errorf("union arg %v has unknown option: %v", typ.Name(), name)
 		}
-		opt, err := parseArg(optType, p, vars)
+		opt, err := target.parseArg(optType, p, vars)
 		if err != nil {
 			return nil, err
 		}
@@ -358,13 +382,21 @@ const (
 	maxLineLen       = 256 << 10
 )
 
-func serializeAddr(a *Arg, base bool) string {
-	page := a.AddrPage * encodingPageSize
-	if base {
-		page += encodingAddrBase
+func serializeAddr(arg Arg) string {
+	var pageIndex, pagesNum uint64
+	var pageOffset int
+	switch a := arg.(type) {
+	case *PointerArg:
+		pageIndex = a.PageIndex
+		pageOffset = a.PageOffset
+		pagesNum = a.PagesNum
+	default:
+		panic("bad addr arg")
 	}
+	page := pageIndex * encodingPageSize
+	page += encodingAddrBase
 	soff := ""
-	if off := a.AddrOffset; off != 0 {
+	if off := pageOffset; off != 0 {
 		sign := "+"
 		if off < 0 {
 			sign = "-"
@@ -374,14 +406,14 @@ func serializeAddr(a *Arg, base bool) string {
 		soff = fmt.Sprintf("%v0x%x", sign, off)
 	}
 	ssize := ""
-	if size := a.AddrPagesNum; size != 0 {
+	if size := pagesNum; size != 0 {
 		size *= encodingPageSize
 		ssize = fmt.Sprintf("/0x%x", size)
 	}
 	return fmt.Sprintf("(0x%x%v%v)", page, soff, ssize)
 }
 
-func parseAddr(p *parser, base bool) (uintptr, int, uintptr, error) {
+func parseAddr(p *parser, base bool) (uint64, int, uint64, error) {
 	p.Parse('(')
 	pstr := p.Ident()
 	page, err := strconv.ParseUint(pstr, 0, 64)
@@ -428,7 +460,7 @@ func parseAddr(p *parser, base bool) (uintptr, int, uintptr, error) {
 	p.Parse(')')
 	page /= encodingPageSize
 	size /= encodingPageSize
-	return uintptr(page), int(off), uintptr(size), nil
+	return page, int(off), size, nil
 }
 
 type parser struct {

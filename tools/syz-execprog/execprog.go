@@ -12,24 +12,29 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/signal"
+	"runtime"
 	"sync"
-	"sync/atomic"
-	"syscall"
 	"time"
 
-	"github.com/google/syzkaller/cover"
-	"github.com/google/syzkaller/ipc"
-	. "github.com/google/syzkaller/log"
+	"github.com/google/syzkaller/pkg/cover"
+	"github.com/google/syzkaller/pkg/ipc"
+	. "github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
+	_ "github.com/google/syzkaller/sys"
 )
 
 var (
+	flagOS        = flag.String("os", runtime.GOOS, "target os")
+	flagArch      = flag.String("arch", runtime.GOARCH, "target arch")
 	flagExecutor  = flag.String("executor", "./syz-executor", "path to executor binary")
 	flagCoverFile = flag.String("coverfile", "", "write coverage to the file")
 	flagRepeat    = flag.Int("repeat", 1, "repeat execution that many times (0 for infinite loop)")
 	flagProcs     = flag.Int("procs", 1, "number of parallel processes to execute programs")
 	flagOutput    = flag.String("output", "none", "write programs to none/stdout")
+	flagFaultCall = flag.Int("fault_call", -1, "inject fault into this call (0-based)")
+	flagFaultNth  = flag.Int("fault_nth", 0, "inject fault on n-th operation (0-based)")
+	flagHints     = flag.Bool("hints", false, "do a hints-generation run")
 )
 
 func main() {
@@ -40,42 +45,60 @@ func main() {
 		os.Exit(1)
 	}
 
-	var progs []*prog.Prog
+	target, err := prog.GetTarget(*flagOS, *flagArch)
+	if err != nil {
+		Fatalf("%v", err)
+	}
+
+	var entries []*prog.LogEntry
 	for _, fn := range flag.Args() {
 		data, err := ioutil.ReadFile(fn)
 		if err != nil {
 			Fatalf("failed to read log file: %v", err)
 		}
-		entries := prog.ParseLog(data)
-		for _, ent := range entries {
-			progs = append(progs, ent.P)
-		}
+		entries = target.ParseLog(data)
 	}
-	Logf(0, "parsed %v programs", len(progs))
-	if len(progs) == 0 {
+	Logf(0, "parsed %v programs", len(entries))
+	if len(entries) == 0 {
 		return
 	}
 
-	flags, timeout, err := ipc.DefaultFlags()
+	execOpts := &ipc.ExecOpts{}
+	config, err := ipc.DefaultConfig()
 	if err != nil {
 		Fatalf("%v", err)
 	}
-	needCover := flags&ipc.FlagSignal != 0
-	dedupCover := true
+	if config.Flags&ipc.FlagSignal != 0 {
+		execOpts.Flags |= ipc.FlagCollectCover
+	}
+	execOpts.Flags |= ipc.FlagDedupCover
 	if *flagCoverFile != "" {
-		flags |= ipc.FlagSignal
-		needCover = true
-		dedupCover = false
+		config.Flags |= ipc.FlagSignal
+		execOpts.Flags |= ipc.FlagCollectCover
+		execOpts.Flags &^= ipc.FlagDedupCover
+	}
+	if *flagHints {
+		if execOpts.Flags&ipc.FlagCollectCover != 0 {
+			execOpts.Flags ^= ipc.FlagCollectCover
+		}
+		execOpts.Flags |= ipc.FlagCollectComps
+	}
+
+	if *flagFaultCall >= 0 {
+		config.Flags |= ipc.FlagEnableFault
+		execOpts.Flags |= ipc.FlagInjectFault
+		execOpts.FaultCall = *flagFaultCall
+		execOpts.FaultNth = *flagFaultNth
 	}
 
 	handled := make(map[string]bool)
-	for _, prog := range progs {
-		for _, call := range prog.Calls {
+	for _, entry := range entries {
+		for _, call := range entry.P.Calls {
 			handled[call.Meta.CallName] = true
 		}
 	}
-	if handled["syz_emit_ethernet"] {
-		flags |= ipc.FlagEnableTun
+	if handled["syz_emit_ethernet"] || handled["syz_extract_tcp_res"] {
+		config.Flags |= ipc.FlagEnableTun
 	}
 
 	var wg sync.WaitGroup
@@ -84,12 +107,12 @@ func main() {
 	gate := ipc.NewGate(2**flagProcs, nil)
 	var pos int
 	var lastPrint time.Time
-	var shutdown uint32
+	shutdown := make(chan struct{})
 	for p := 0; p < *flagProcs; p++ {
 		pid := p
 		go func() {
 			defer wg.Done()
-			env, err := ipc.MakeEnv(*flagExecutor, timeout, flags, pid)
+			env, err := ipc.MakeEnv(*flagExecutor, pid, config)
 			if err != nil {
 				Fatalf("failed to create ipc env: %v", err)
 			}
@@ -103,30 +126,44 @@ func main() {
 					posMu.Lock()
 					idx := pos
 					pos++
-					if idx%len(progs) == 0 && time.Since(lastPrint) > 5*time.Second {
+					if idx%len(entries) == 0 && time.Since(lastPrint) > 5*time.Second {
 						Logf(0, "executed programs: %v", idx)
 						lastPrint = time.Now()
 					}
 					posMu.Unlock()
-					if *flagRepeat > 0 && idx >= len(progs)**flagRepeat {
+					if *flagRepeat > 0 && idx >= len(entries)**flagRepeat {
 						return false
 					}
-					p := progs[idx%len(progs)]
+					entry := entries[idx%len(entries)]
+					callOpts := execOpts
+					if *flagFaultCall == -1 && entry.Fault {
+						newOpts := *execOpts
+						newOpts.Flags |= ipc.FlagInjectFault
+						newOpts.FaultCall = entry.FaultCall
+						newOpts.FaultNth = entry.FaultNth
+						callOpts = &newOpts
+					}
 					switch *flagOutput {
 					case "stdout":
-						data := p.Serialize()
+						strOpts := ""
+						if callOpts.Flags&ipc.FlagInjectFault != 0 {
+							strOpts = fmt.Sprintf(" (fault-call:%v fault-nth:%v)", callOpts.FaultCall, callOpts.FaultNth)
+						}
+						data := entry.P.Serialize()
 						logMu.Lock()
-						Logf(0, "executing program %v:\n%s", pid, data)
+						Logf(0, "executing program %v%v:\n%s", pid, strOpts, data)
 						logMu.Unlock()
 					}
-					output, info, failed, hanged, err := env.Exec(p, needCover, dedupCover)
-					if atomic.LoadUint32(&shutdown) != 0 {
+					output, info, failed, hanged, err := env.Exec(callOpts, entry.P)
+					select {
+					case <-shutdown:
 						return false
+					default:
 					}
 					if failed {
 						fmt.Printf("BUG: executor-detected bug:\n%s", output)
 					}
-					if flags&ipc.FlagDebug != 0 || err != nil {
+					if config.Flags&ipc.FlagDebug != 0 || err != nil {
 						fmt.Printf("result: failed=%v hanged=%v err=%v\n\n%s", failed, hanged, err, output)
 					}
 					if *flagCoverFile != "" {
@@ -143,11 +180,35 @@ func main() {
 							for _, pc := range inf.Cover {
 								binary.Write(buf, binary.LittleEndian, cover.RestorePC(pc, 0xffffffff))
 							}
-							err := ioutil.WriteFile(fmt.Sprintf("%v.%v", *flagCoverFile, i), buf.Bytes(), 0660)
+							err := osutil.WriteFile(fmt.Sprintf("%v.%v", *flagCoverFile, i), buf.Bytes())
 							if err != nil {
 								Fatalf("failed to write coverage file: %v", err)
 							}
 						}
+					}
+					if *flagHints {
+						compMaps := ipc.GetCompMaps(info)
+						ncomps, ncandidates := 0, 0
+						for i := range entry.P.Calls {
+							comps := compMaps[i]
+							for v, args := range comps {
+								ncomps += len(args)
+								if *flagOutput == "stdout" {
+									fmt.Printf("comp 0x%x:", v)
+									for arg := range args {
+										fmt.Printf(" 0x%x", arg)
+									}
+									fmt.Printf("\n")
+								}
+							}
+							entry.P.MutateWithHints(i, comps, func(p *prog.Prog) {
+								ncandidates++
+								if *flagOutput == "stdout" {
+									fmt.Printf("PROGRAM:\n%s\n", p.Serialize())
+								}
+							})
+						}
+						fmt.Printf("ncomps=%v ncandidates=%v\n", ncomps, ncandidates)
 					}
 					return true
 				}() {
@@ -157,15 +218,6 @@ func main() {
 		}()
 	}
 
-	go func() {
-		c := make(chan os.Signal, 2)
-		signal.Notify(c, syscall.SIGINT)
-		<-c
-		Logf(0, "shutting down...")
-		atomic.StoreUint32(&shutdown, 1)
-		<-c
-		Fatalf("terminating")
-	}()
-
+	osutil.HandleInterrupts(shutdown)
 	wg.Wait()
 }

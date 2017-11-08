@@ -15,8 +15,11 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
+	_ "github.com/google/syzkaller/sys"
 )
 
 func main() {
@@ -27,13 +30,17 @@ func main() {
 	if err != nil {
 		fatalf("failed to read corpus dir: %v", err)
 	}
+	target, err := prog.GetTarget(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		fatalf("%v", err)
+	}
 	for _, f := range files {
 		fname := filepath.Join(os.Args[1], f.Name())
 		data, err := ioutil.ReadFile(fname)
 		if err != nil {
 			fatalf("failed to read program: %v", err)
 		}
-		p, err := prog.Deserialize(data)
+		p, err := target.Deserialize(data)
 		if err != nil {
 			fatalf("failed to deserialize program: %v", err)
 		}
@@ -44,7 +51,7 @@ func main() {
 		fmt.Printf("upgrading:\n%s\nto:\n%s\n\n", data, data1)
 		hash := sha1.Sum(data1)
 		fname1 := filepath.Join(os.Args[1], hex.EncodeToString(hash[:]))
-		if err := ioutil.WriteFile(fname1, data1, 0640); err != nil {
+		if err := osutil.WriteFile(fname1, data1); err != nil {
 			fatalf("failed to write program: %v", err)
 		}
 		if err := os.Remove(fname); err != nil {

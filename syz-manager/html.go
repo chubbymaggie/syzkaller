@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"html/template"
 	"io"
@@ -19,10 +20,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/syzkaller/cover"
-	. "github.com/google/syzkaller/log"
-	"github.com/google/syzkaller/prog"
-	"github.com/google/syzkaller/sys"
+	"github.com/google/syzkaller/pkg/cover"
+	. "github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/osutil"
 )
 
 const dateFormat = "Jan 02 2006 15:04:05 MST"
@@ -35,6 +35,7 @@ func (mgr *Manager) initHttp() {
 	http.HandleFunc("/prio", mgr.httpPrio)
 	http.HandleFunc("/file", mgr.httpFile)
 	http.HandleFunc("/report", mgr.httpReport)
+	http.HandleFunc("/rawcover", mgr.httpRawCover)
 
 	ln, err := net.Listen("tcp4", mgr.cfg.Http)
 	if err != nil {
@@ -144,7 +145,7 @@ func (mgr *Manager) httpCorpus(w http.ResponseWriter, r *http.Request) {
 		if call != inp.Call {
 			continue
 		}
-		p, err := prog.Deserialize(inp.Prog)
+		p, err := mgr.target.Deserialize(inp.Prog)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to deserialize program: %v", err), http.StatusInternalServerError)
 			return
@@ -168,6 +169,10 @@ func (mgr *Manager) httpCover(w http.ResponseWriter, r *http.Request) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 
+	if mgr.cfg.Vmlinux == "" {
+		http.Error(w, fmt.Sprintf("no vmlinux in config file"), http.StatusInternalServerError)
+		return
+	}
 	var cov cover.Cover
 	if sig := r.FormValue("input"); sig != "" {
 		cov = mgr.corpus[sig].Cover
@@ -194,7 +199,7 @@ func (mgr *Manager) httpPrio(w http.ResponseWriter, r *http.Request) {
 	mgr.minimizeCorpus()
 	call := r.FormValue("call")
 	idx := -1
-	for i, c := range sys.Calls {
+	for i, c := range mgr.target.Syscalls {
 		if c.CallName == call {
 			idx = i
 			break
@@ -207,7 +212,7 @@ func (mgr *Manager) httpPrio(w http.ResponseWriter, r *http.Request) {
 
 	data := &UIPrioData{Call: call}
 	for i, p := range mgr.prios[idx] {
-		data.Prios = append(data.Prios, UIPrio{sys.Calls[i].Name, p})
+		data.Prios = append(data.Prios, UIPrio{mgr.target.Syscalls[i].Name, p})
 	}
 	sort.Sort(UIPrioArray(data.Prios))
 
@@ -218,9 +223,6 @@ func (mgr *Manager) httpPrio(w http.ResponseWriter, r *http.Request) {
 }
 
 func (mgr *Manager) httpFile(w http.ResponseWriter, r *http.Request) {
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-
 	file := filepath.Clean(r.FormValue("name"))
 	if !strings.HasPrefix(file, "crashes/") && !strings.HasPrefix(file, "corpus/") {
 		http.Error(w, "oh, oh, oh!", http.StatusInternalServerError)
@@ -250,11 +252,27 @@ func (mgr *Manager) httpReport(w http.ResponseWriter, r *http.Request) {
 	tag, _ := ioutil.ReadFile(filepath.Join(mgr.crashdir, crashID, "repro.tag"))
 	prog, _ := ioutil.ReadFile(filepath.Join(mgr.crashdir, crashID, "repro.prog"))
 	cprog, _ := ioutil.ReadFile(filepath.Join(mgr.crashdir, crashID, "repro.cprog"))
-	report, _ := ioutil.ReadFile(filepath.Join(mgr.crashdir, crashID, "repro.report"))
+	rep, _ := ioutil.ReadFile(filepath.Join(mgr.crashdir, crashID, "repro.report"))
+	log, _ := ioutil.ReadFile(filepath.Join(mgr.crashdir, crashID, "repro.stats.log"))
+	stats, _ := ioutil.ReadFile(filepath.Join(mgr.crashdir, crashID, "repro.stats"))
 
-	fmt.Fprintf(w, "Syzkaller hit '%s' bug on commit %s.\n\n", trimNewLines(desc), trimNewLines(tag))
-	if len(report) != 0 {
-		fmt.Fprintf(w, "%s\n\n", report)
+	commitDesc := ""
+	if len(tag) != 0 {
+		commitDesc = fmt.Sprintf(" on commit %s.", trimNewLines(tag))
+	}
+	fmt.Fprintf(w, "Syzkaller hit '%s' bug%s.\n\n", trimNewLines(desc), commitDesc)
+	if len(rep) != 0 {
+		guiltyFile := mgr.getReporter().ExtractGuiltyFile(rep)
+		if guiltyFile != "" {
+			fmt.Fprintf(w, "Guilty file: %v\n\n", guiltyFile)
+			maintainers, err := mgr.getReporter().GetMaintainers(guiltyFile)
+			if err == nil {
+				fmt.Fprintf(w, "Maintainers: %v\n\n", maintainers)
+			} else {
+				fmt.Fprintf(w, "Failed to extract maintainers: %v\n\n", err)
+			}
+		}
+		fmt.Fprintf(w, "%s\n\n", rep)
 	}
 	if len(prog) == 0 && len(cprog) == 0 {
 		fmt.Fprintf(w, "The bug is not reproducible.\n")
@@ -264,11 +282,41 @@ func (mgr *Manager) httpReport(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "C reproducer:\n%s\n\n", cprog)
 		}
 	}
+	if len(stats) > 0 {
+		fmt.Fprintf(w, "Reproducing stats:\n%s\n\n", stats)
+	}
+	if len(log) > 0 {
+		fmt.Fprintf(w, "Reproducing log:\n%s\n\n", log)
+	}
+}
+
+func (mgr *Manager) httpRawCover(w http.ResponseWriter, r *http.Request) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+
+	base, err := getVmOffset(mgr.cfg.Vmlinux)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get vmlinux base: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	var cov cover.Cover
+	for _, inp := range mgr.corpus {
+		cov = cover.Union(cov, cover.Cover(inp.Cover))
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	buf := bufio.NewWriter(w)
+	for _, pc := range cov {
+		restored := cover.RestorePC(pc, base) - callLen
+		fmt.Fprintf(buf, "0x%x\n", restored)
+	}
+	buf.Flush()
 }
 
 func collectCrashes(workdir string) ([]*UICrashType, error) {
 	crashdir := filepath.Join(workdir, "crashes")
-	dirs, err := readdirnames(crashdir)
+	dirs, err := osutil.ListDir(crashdir)
 	if err != nil {
 		return nil, err
 	}
@@ -305,7 +353,7 @@ func readCrash(workdir, dir string, full bool) *UICrashType {
 	modTime := stat.ModTime()
 	descFile.Close()
 
-	files, err := readdirnames(filepath.Join(crashdir, dir))
+	files, err := osutil.ListDir(filepath.Join(crashdir, dir))
 	if err != nil {
 		return nil
 	}
@@ -344,7 +392,7 @@ func readCrash(workdir, dir string, full bool) *UICrashType {
 			tag, _ := ioutil.ReadFile(filepath.Join(crashdir, dir, "tag"+index))
 			crash.Tag = string(tag)
 			reportFile := filepath.Join("crashes", dir, "report"+index)
-			if _, err := os.Stat(filepath.Join(workdir, reportFile)); err == nil {
+			if osutil.IsExist(filepath.Join(workdir, reportFile)) {
 				crash.Report = reportFile
 			}
 		}
@@ -369,15 +417,6 @@ func readCrash(workdir, dir string, full bool) *UICrashType {
 		Triaged:     triaged,
 		Crashes:     crashes,
 	}
-}
-
-func readdirnames(dir string) ([]string, error) {
-	f, err := os.Open(dir)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return f.Readdirnames(-1)
 }
 
 func trimNewLines(data []byte) []byte {

@@ -9,7 +9,7 @@ set -eux
 # Create a minimal Debian-wheezy distributive as a directory.
 sudo rm -rf wheezy
 mkdir -p wheezy
-sudo debootstrap --include=openssh-server,curl,tar,time,strace,sudo,less,psmisc wheezy wheezy
+sudo debootstrap --include=openssh-server,curl,tar,gcc,libc6-dev,time,strace,sudo,less,psmisc wheezy wheezy
 
 # Set some defaults and enable promtless ssh to the machine for root.
 sudo sed -i '/^root/ { s/:x:/::/ }' wheezy/etc/passwd
@@ -21,6 +21,9 @@ echo 'debug.exception-trace = 0' | sudo tee -a wheezy/etc/sysctl.conf
 echo "net.core.bpf_jit_enable = 1" | sudo tee -a wheezy/etc/sysctl.conf
 echo "net.core.bpf_jit_harden = 2" | sudo tee -a wheezy/etc/sysctl.conf
 echo "net.ipv4.ping_group_range = 0 65535" | sudo tee -a wheezy/etc/sysctl.conf
+echo -en "127.0.0.1\tlocalhost\n" | sudo tee wheezy/etc/hosts
+echo "nameserver 8.8.8.8" | sudo tee -a wheezy/etc/resolve.conf
+echo "syzkaller" | sudo tee wheezy/etc/hostname
 sudo mkdir -p wheezy/root/.ssh/
 rm -rf ssh
 mkdir -p ssh
@@ -28,8 +31,8 @@ ssh-keygen -f ssh/id_rsa -t rsa -N ''
 cat ssh/id_rsa.pub | sudo tee wheezy/root/.ssh/authorized_keys
 
 # Build a disk image
-dd if=/dev/zero of=wheezy.img bs=1M seek=1023 count=1
-mkfs.ext4 -F wheezy.img
+dd if=/dev/zero of=wheezy.img bs=1M seek=2047 count=1
+sudo mkfs.ext4 -F wheezy.img
 sudo mkdir -p /mnt/wheezy
 sudo mount -o loop wheezy.img /mnt/wheezy
 sudo cp -a wheezy/. /mnt/wheezy/.
