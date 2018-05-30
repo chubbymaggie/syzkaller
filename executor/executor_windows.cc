@@ -14,7 +14,7 @@
 
 #include "syscalls_windows.h"
 
-uint32_t output;
+uint32 output;
 
 int main(int argc, char** argv)
 {
@@ -22,6 +22,10 @@ int main(int argc, char** argv)
 		puts(GOOS " " GOARCH " " SYZ_REVISION " " GIT_REVISION);
 		return 0;
 	}
+
+	if (VirtualAlloc((void*)SYZ_DATA_OFFSET, SYZ_NUM_PAGES * SYZ_PAGE_SIZE,
+			 MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) != (void*)SYZ_DATA_OFFSET)
+		fail("mmap of data segment failed");
 
 	setup_control_pipes();
 	receive_execute(true);
@@ -50,17 +54,27 @@ void cover_reset(thread_t* th)
 {
 }
 
-uint64_t read_cover_size(thread_t* th)
+uint32 read_cover_size(thread_t* th)
 {
 	return 0;
 }
 
-uint32_t* write_output(uint32_t v)
+bool cover_check(uint32 pc)
+{
+	return true;
+}
+
+bool cover_check(uint64 pc)
+{
+	return true;
+}
+
+uint32* write_output(uint32 v)
 {
 	return &output;
 }
 
-void write_completed(uint32_t completed)
+void write_completed(uint32 completed)
 {
 }
 

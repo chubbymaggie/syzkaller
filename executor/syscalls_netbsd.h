@@ -2,8 +2,10 @@
 
 #if defined(__x86_64__) || 0
 #define GOARCH "amd64"
-#define SYZ_REVISION "b8cf507bff6e073c3fe77c8ab8b9a47cbcf66359"
-
+#define SYZ_REVISION "232e11e345d6f9c3ee0bdcedfacc59d22adfcb2b"
+#define SYZ_PAGE_SIZE 4096
+#define SYZ_NUM_PAGES 4096
+#define SYZ_DATA_OFFSET 536870912
 unsigned syscall_count = 188;
 call_t syscalls[] = {
     {"accept", 30},

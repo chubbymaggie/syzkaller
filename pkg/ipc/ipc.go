@@ -26,25 +26,29 @@ import (
 )
 
 // Configuration flags for Config.Flags.
+type EnvFlags uint64
+
 const (
-	FlagDebug            = uint64(1) << iota // debug output from executor
-	FlagSignal                               // collect feedback signals (coverage)
-	FlagThreaded                             // use multiple threads to mitigate blocked syscalls
-	FlagCollide                              // collide syscalls to provoke data races
-	FlagSandboxSetuid                        // impersonate nobody user
-	FlagSandboxNamespace                     // use namespaces for sandboxing
-	FlagEnableTun                            // initialize and use tun in executor
-	FlagEnableFault                          // enable fault injection support
-	FlagUseShmem                             // use shared memory instead of pipes for communication
-	FlagUseForkServer                        // use extended protocol with handshake
+	FlagDebug            EnvFlags = 1 << iota // debug output from executor
+	FlagSignal                                // collect feedback signals (coverage)
+	FlagSandboxSetuid                         // impersonate nobody user
+	FlagSandboxNamespace                      // use namespaces for sandboxing
+	FlagEnableTun                             // initialize and use tun in executor
+	FlagEnableFault                           // enable fault injection support
+	FlagUseShmem                              // use shared memory instead of pipes for communication
+	FlagUseForkServer                         // use extended protocol with handshake
 )
 
 // Per-exec flags for ExecOpts.Flags:
+type ExecFlags uint64
+
 const (
-	FlagCollectCover = uint64(1) << iota // collect coverage
-	FlagDedupCover                       // deduplicate coverage in executor
-	FlagInjectFault                      // inject a fault in this execution (see ExecOpts)
-	FlagCollectComps                     // collect KCOV comparisons
+	FlagCollectCover ExecFlags = 1 << iota // collect coverage
+	FlagDedupCover                         // deduplicate coverage in executor
+	FlagInjectFault                        // inject a fault in this execution (see ExecOpts)
+	FlagCollectComps                       // collect KCOV comparisons
+	FlagThreaded                           // use multiple threads to mitigate blocked syscalls
+	FlagCollide                            // collide syscalls to provoke data races
 )
 
 const (
@@ -56,19 +60,21 @@ const (
 )
 
 var (
+	flagExecutor    = flag.String("executor", "./syz-executor", "path to executor binary")
 	flagThreaded    = flag.Bool("threaded", true, "use threaded mode in executor")
 	flagCollide     = flag.Bool("collide", true, "collide syscalls to provoke data races")
-	flagSignal      = flag.Bool("cover", true, "collect feedback signals (coverage)")
+	flagSignal      = flag.Bool("cover", false, "collect feedback signals (coverage)")
 	flagSandbox     = flag.String("sandbox", "none", "sandbox for fuzzing (none/setuid/namespace)")
 	flagDebug       = flag.Bool("debug", false, "debug output from executor")
 	flagTimeout     = flag.Duration("timeout", 0, "execution timeout")
-	flagAbortSignal = flag.Int("abort_signal", 0, "initial signal to send to executor in error conditions; upgrades to SIGKILL if executor does not exit")
-	flagBufferSize  = flag.Uint64("buffer_size", 0, "internal buffer size (in bytes) for executor output")
-	flagIPC         = flag.String("ipc", "", "ipc scheme (pipe/shmem)")
+	flagAbortSignal = flag.Int("abort_signal", 0, "initial signal to send to executor"+
+		" in error conditions; upgrades to SIGKILL if executor does not exit")
+	flagBufferSize = flag.Uint64("buffer_size", 0, "internal buffer size (in bytes) for executor output")
+	flagIPC        = flag.String("ipc", "", "ipc scheme (pipe/shmem)")
 )
 
 type ExecOpts struct {
-	Flags     uint64
+	Flags     ExecFlags
 	FaultCall int // call index for fault injection (0-based)
 	FaultNth  int // fault n-th operation in the call (0-based)
 }
@@ -83,8 +89,11 @@ func (err ExecutorFailure) Error() string {
 
 // Config is the configuration for Env.
 type Config struct {
+	// Path to executor binary.
+	Executor string
+
 	// Flags are configuation flags, defined above.
-	Flags uint64
+	Flags EnvFlags
 
 	// Timeout is the execution timeout for a single program.
 	Timeout time.Duration
@@ -96,16 +105,18 @@ type Config struct {
 	BufferSize uint64
 }
 
-func DefaultConfig() (Config, error) {
-	var c Config
-	if *flagThreaded {
-		c.Flags |= FlagThreaded
-	}
-	if *flagCollide {
-		c.Flags |= FlagCollide
+func DefaultConfig() (*Config, *ExecOpts, error) {
+	c := &Config{
+		Executor:    *flagExecutor,
+		Timeout:     *flagTimeout,
+		AbortSignal: *flagAbortSignal,
+		BufferSize:  *flagBufferSize,
 	}
 	if *flagSignal {
 		c.Flags |= FlagSignal
+	}
+	if *flagDebug {
+		c.Flags |= FlagDebug
 	}
 	switch *flagSandbox {
 	case "none":
@@ -114,14 +125,8 @@ func DefaultConfig() (Config, error) {
 	case "namespace":
 		c.Flags |= FlagSandboxNamespace
 	default:
-		return Config{}, fmt.Errorf("flag sandbox must contain one of none/setuid/namespace")
+		return nil, nil, fmt.Errorf("flag sandbox must contain one of none/setuid/namespace")
 	}
-	if *flagDebug {
-		c.Flags |= FlagDebug
-	}
-	c.Timeout = *flagTimeout
-	c.AbortSignal = *flagAbortSignal
-	c.BufferSize = *flagBufferSize
 
 	sysTarget := targets.List[runtime.GOOS][runtime.GOARCH]
 	if sysTarget.ExecutorUsesShmem {
@@ -137,10 +142,20 @@ func DefaultConfig() (Config, error) {
 	case "shmem":
 		c.Flags |= FlagUseShmem
 	default:
-		return Config{}, fmt.Errorf("unknown ipc scheme: %v", *flagIPC)
+		return nil, nil, fmt.Errorf("unknown ipc scheme: %v", *flagIPC)
 	}
 
-	return c, nil
+	opts := &ExecOpts{
+		Flags: FlagDedupCover,
+	}
+	if *flagThreaded {
+		opts.Flags |= FlagThreaded
+	}
+	if *flagCollide {
+		opts.Flags |= FlagCollide
+	}
+
+	return c, opts, nil
 }
 
 type CallInfo struct {
@@ -152,14 +167,6 @@ type CallInfo struct {
 	FaultInjected bool
 }
 
-func GetCompMaps(info []CallInfo) []prog.CompMap {
-	compMaps := make([]prog.CompMap, len(info))
-	for i, inf := range info {
-		compMaps[i] = inf.Comps
-	}
-	return compMaps
-}
-
 type Env struct {
 	in  []byte
 	out []byte
@@ -169,7 +176,7 @@ type Env struct {
 	outFile *os.File
 	bin     []string
 	pid     int
-	config  Config
+	config  *Config
 
 	StatExecs    uint64
 	StatRestarts uint64
@@ -182,27 +189,7 @@ const (
 	compConstMask = 1
 )
 
-func MakeEnv(bin string, pid int, config Config) (*Env, error) {
-	const (
-		executorTimeout = 5 * time.Second
-		minTimeout      = executorTimeout + 2*time.Second
-	)
-	if config.Timeout == 0 {
-		// Executor protects against most hangs, so we use quite large timeout here.
-		// Executor can be slow due to global locks in namespaces and other things,
-		// so let's better wait than report false misleading crashes.
-		config.Timeout = time.Minute
-		if config.Flags&FlagUseForkServer == 0 {
-			// If there is no fork server, executor does not have internal timeout.
-			config.Timeout = executorTimeout
-		}
-	}
-	// IPC timeout must be larger then executor timeout.
-	// Otherwise IPC will kill parent executor but leave child executor alive.
-	if config.Flags&FlagUseForkServer != 0 && config.Timeout < minTimeout {
-		config.Timeout = minTimeout
-	}
-
+func MakeEnv(config *Config, pid int) (*Env, error) {
 	var inf, outf *os.File
 	var inmem, outmem []byte
 	if config.Flags&FlagUseShmem != 0 {
@@ -233,7 +220,7 @@ func MakeEnv(bin string, pid int, config Config) (*Env, error) {
 		out:     outmem,
 		inFile:  inf,
 		outFile: outf,
-		bin:     strings.Split(bin, " "),
+		bin:     strings.Split(config.Executor, " "),
 		pid:     pid,
 		config:  config,
 	}
@@ -299,7 +286,7 @@ func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info []CallIn
 		})
 	}
 	// Copy-in serialized program.
-	progSize, err := p.SerializeForExec(env.in, env.pid)
+	progSize, err := p.SerializeForExec(env.in)
 	if err != nil {
 		err0 = fmt.Errorf("executor %v: failed to serialize: %v", env.pid, err)
 		return
@@ -308,8 +295,7 @@ func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info []CallIn
 	if env.config.Flags&FlagUseShmem == 0 {
 		progData = env.in[:progSize]
 	}
-	needOutput := env.config.Flags&FlagSignal != 0 || opts.Flags&FlagCollectComps != 0
-	if needOutput && env.out != nil {
+	if env.out != nil {
 		// Zero out the first two words (ncmd and nsig), so that we don't have garbage there
 		// if executor crashes before writing non-garbage there.
 		for i := 0; i < 4; i++ {
@@ -333,7 +319,7 @@ func (env *Env) Exec(opts *ExecOpts, p *prog.Prog) (output []byte, info []CallIn
 		return
 	}
 
-	if needOutput && env.out != nil {
+	if env.out != nil {
 		info, err0 = env.readOutCoverage(p)
 	}
 	return
@@ -390,7 +376,9 @@ func (env *Env) readOutCoverage(p *prog.Prog) (info []CallInfo, err0 error) {
 	}
 	for i := uint32(0); i < ncmd; i++ {
 		var callIndex, callNum, errno, faultInjected, signalSize, coverSize, compsSize uint32
-		if !readOut(&callIndex) || !readOut(&callNum) || !readOut(&errno) || !readOut(&faultInjected) || !readOut(&signalSize) || !readOut(&coverSize) || !readOut(&compsSize) {
+		if !readOut(&callIndex) || !readOut(&callNum) || !readOut(&errno) ||
+			!readOut(&faultInjected) || !readOut(&signalSize) ||
+			!readOut(&coverSize) || !readOut(&compsSize) {
 			err0 = fmt.Errorf("executor %v: failed to read output coverage", env.pid)
 			return
 		}
@@ -401,7 +389,8 @@ func (env *Env) readOutCoverage(p *prog.Prog) (info []CallInfo, err0 error) {
 		}
 		c := p.Calls[callIndex]
 		if num := c.Meta.ID; uint32(num) != callNum {
-			err0 = fmt.Errorf("executor %v: failed to read output coverage: record %v call %v: expect syscall %v, got %v, executed %v (cov: %v)",
+			err0 = fmt.Errorf("executor %v: failed to read output coverage:"+
+				" record %v call %v: expect syscall %v, got %v, executed %v (cov: %v)",
 				env.pid, i, callIndex, num, callNum, ncmd, dumpCov())
 			return
 		}
@@ -480,7 +469,8 @@ func (env *Env) readOutCoverage(p *prog.Prog) (info []CallInfo, err0 error) {
 
 type command struct {
 	pid      int
-	config   Config
+	config   *Config
+	timeout  time.Duration
 	cmd      *exec.Cmd
 	dir      string
 	readDone chan []byte
@@ -523,6 +513,8 @@ type executeReply struct {
 	status uint32
 }
 
+// TODO(dvyukov): we currently parse this manually, should cast output to this struct instead.
+/*
 type callReply struct {
 	callIndex     uint32
 	callNum       uint32
@@ -534,17 +526,19 @@ type callReply struct {
 	compsSize     uint32
 	// signal/cover/comps follow
 }
+*/
 
-func makeCommand(pid int, bin []string, config Config, inFile *os.File, outFile *os.File) (*command, error) {
+func makeCommand(pid int, bin []string, config *Config, inFile *os.File, outFile *os.File) (*command, error) {
 	dir, err := ioutil.TempDir("./", "syzkaller-testdir")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %v", err)
 	}
 
 	c := &command{
-		pid:    pid,
-		config: config,
-		dir:    dir,
+		pid:     pid,
+		config:  config,
+		timeout: sanitizeTimeout(config),
+		dir:     dir,
 	}
 	defer func() {
 		if c != nil {
@@ -584,7 +578,7 @@ func makeCommand(pid int, bin []string, config Config, inFile *os.File, outFile 
 	c.readDone = make(chan []byte, 1)
 	c.exited = make(chan struct{})
 
-	cmd := exec.Command(bin[0], bin[1:]...)
+	cmd := osutil.Command(bin[0], bin[1:]...)
 	if inFile != nil && outFile != nil {
 		cmd.ExtraFiles = []*os.File{inFile, outFile}
 	}
@@ -662,13 +656,12 @@ func (c *command) close() {
 func (c *command) handshake() error {
 	req := &handshakeReq{
 		magic: inMagic,
-		flags: c.config.Flags,
+		flags: uint64(c.config.Flags),
 		pid:   uint64(c.pid),
 	}
 	reqData := (*[unsafe.Sizeof(*req)]byte)(unsafe.Pointer(req))[:]
 	if _, err := c.outwp.Write(reqData); err != nil {
-		return c.handshakeError(fmt.Errorf("executor %v: failed to write control pipe: %v",
-			c.pid, err))
+		return c.handshakeError(fmt.Errorf("failed to write control pipe: %v", err))
 	}
 
 	read := make(chan error, 1)
@@ -680,8 +673,7 @@ func (c *command) handshake() error {
 			return
 		}
 		if reply.magic != outMagic {
-			read <- fmt.Errorf("executor %v: bad handshake reply magic 0x%x",
-				c.pid, reply.magic)
+			read <- fmt.Errorf("bad handshake reply magic 0x%x", reply.magic)
 			return
 		}
 		read <- nil
@@ -695,14 +687,14 @@ func (c *command) handshake() error {
 		}
 		return nil
 	case <-timeout.C:
-		return c.handshakeError(fmt.Errorf("executor %v: not serving", c.pid))
+		return c.handshakeError(fmt.Errorf("not serving"))
 	}
 }
 
 func (c *command) handshakeError(err error) error {
 	c.abort()
 	output := <-c.readDone
-	err = fmt.Errorf("%v\n%s", err, output)
+	err = fmt.Errorf("executor %v: %v\n%s", c.pid, err, output)
 	c.wait()
 	if c.cmd.ProcessState != nil {
 		// Magic values returned by executor.
@@ -744,8 +736,8 @@ func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, failed, 
 	restart bool, err0 error) {
 	req := &executeReq{
 		magic:     inMagic,
-		envFlags:  c.config.Flags,
-		execFlags: opts.Flags,
+		envFlags:  uint64(c.config.Flags),
+		execFlags: uint64(opts.Flags),
 		pid:       uint64(c.pid),
 		faultCall: uint64(opts.FaultCall),
 		faultNth:  uint64(opts.FaultNth),
@@ -769,7 +761,7 @@ func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, failed, 
 	done := make(chan bool)
 	hang := make(chan bool)
 	go func() {
-		t := time.NewTimer(c.config.Timeout)
+		t := time.NewTimer(c.timeout)
 		select {
 		case <-t.C:
 			c.abort()
@@ -779,7 +771,7 @@ func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, failed, 
 			hang <- false
 		}
 	}()
-	exitStatus := 0
+	var exitStatus int
 	if c.config.Flags&FlagUseForkServer == 0 {
 		restart = true
 		c.cmd.Wait()
@@ -847,8 +839,26 @@ func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, failed, 
 	return
 }
 
-func serializeUint64(buf []byte, v uint64) {
-	for i := 0; i < 8; i++ {
-		buf[i] = byte(v >> (8 * uint(i)))
+func sanitizeTimeout(config *Config) time.Duration {
+	const (
+		executorTimeout = 5 * time.Second
+		minTimeout      = executorTimeout + 2*time.Second
+	)
+	timeout := config.Timeout
+	if timeout == 0 {
+		// Executor protects against most hangs, so we use quite large timeout here.
+		// Executor can be slow due to global locks in namespaces and other things,
+		// so let's better wait than report false misleading crashes.
+		timeout = time.Minute
+		if config.Flags&FlagUseForkServer == 0 {
+			// If there is no fork server, executor does not have internal timeout.
+			timeout = executorTimeout
+		}
 	}
+	// IPC timeout must be larger then executor timeout.
+	// Otherwise IPC will kill parent executor but leave child executor alive.
+	if config.Flags&FlagUseForkServer != 0 && timeout < minTimeout {
+		timeout = minTimeout
+	}
+	return timeout
 }

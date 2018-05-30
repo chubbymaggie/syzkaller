@@ -5,7 +5,6 @@ package report
 
 import (
 	"bytes"
-	"fmt"
 	"regexp"
 
 	"github.com/google/syzkaller/pkg/symbolizer"
@@ -33,7 +32,10 @@ func (ctx *freebsd) ContainsCrash(output []byte) bool {
 	return containsCrash(output, freebsdOopses, ctx.ignores)
 }
 
-func (ctx *freebsd) Parse(output []byte) (desc string, text []byte, start int, end int) {
+func (ctx *freebsd) Parse(output []byte) *Report {
+	rep := &Report{
+		Output: output,
+	}
 	var oops *oops
 	for pos := 0; pos < len(output); {
 		next := bytes.IndexByte(output[pos:], '\n')
@@ -49,10 +51,10 @@ func (ctx *freebsd) Parse(output []byte) (desc string, text []byte, start int, e
 			}
 			if oops == nil {
 				oops = oops1
-				start = pos
-				desc = string(output[pos+match : next])
+				rep.StartPos = pos
+				rep.Title = string(output[pos+match : next])
 			}
-			end = next
+			rep.EndPos = next
 		}
 		// Console output is indistinguishable from fuzzer output,
 		// so we just collect everything after the oops.
@@ -61,45 +63,38 @@ func (ctx *freebsd) Parse(output []byte) (desc string, text []byte, start int, e
 			if lineEnd != 0 && output[lineEnd-1] == '\r' {
 				lineEnd--
 			}
-			text = append(text, output[pos:lineEnd]...)
-			text = append(text, '\n')
+			rep.Report = append(rep.Report, output[pos:lineEnd]...)
+			rep.Report = append(rep.Report, '\n')
 		}
 		pos = next + 1
 	}
 	if oops == nil {
-		return
+		return nil
 	}
-	desc = extractDescription(output[start:], oops)
-	return
+	title, corrupted, _ := extractDescription(output[rep.StartPos:], oops, freebsdStackParams)
+	rep.Title = title
+	rep.Corrupted = corrupted != ""
+	rep.corruptedReason = corrupted
+	return rep
 }
 
-func (ctx *freebsd) Symbolize(text []byte) ([]byte, error) {
-	return nil, fmt.Errorf("not implemented")
+func (ctx *freebsd) Symbolize(rep *Report) error {
+	return nil
 }
 
-func (ctx *freebsd) ExtractConsoleOutput(output []byte) (result []byte) {
-	return output
-}
-
-func (ctx *freebsd) ExtractGuiltyFile(report []byte) string {
-	return ""
-}
-
-func (ctx *freebsd) GetMaintainers(file string) ([]string, error) {
-	return nil, fmt.Errorf("not implemented")
-}
+var freebsdStackParams = &stackParams{}
 
 var freebsdOopses = []*oops{
 	&oops{
 		[]byte("Fatal trap"),
 		[]oopsFormat{
 			{
-				compile("Fatal trap (.+?)\\r?\\n(?:.*\\n)+?" +
+				title: compile("Fatal trap (.+?)\\r?\\n(?:.*\\n)+?" +
 					"KDB: stack backtrace:\\r?\\n" +
 					"(?:#[0-9]+ {{ADDR}} at (?:kdb_backtrace|vpanic|panic|trap_fatal|" +
 					"trap_pfault|trap|calltrap|m_copydata|__rw_wlock_hard)" +
 					"\\+{{ADDR}}\\r?\\n)*#[0-9]+ {{ADDR}} at {{FUNC}}{{ADDR}}"),
-				"Fatal trap %[1]v in %[2]v",
+				fmt: "Fatal trap %[1]v in %[2]v",
 			},
 		},
 		[]*regexp.Regexp{},
@@ -108,8 +103,8 @@ var freebsdOopses = []*oops{
 		[]byte("panic:"),
 		[]oopsFormat{
 			{
-				compile("panic: ffs_write: type {{ADDR}} [0-9]+ \\([0-9]+,[0-9]+\\)"),
-				"panic: ffs_write: type ADDR X (Y,Z)",
+				title: compile("panic: ffs_write: type {{ADDR}} [0-9]+ \\([0-9]+,[0-9]+\\)"),
+				fmt:   "panic: ffs_write: type ADDR X (Y,Z)",
 			},
 		},
 		[]*regexp.Regexp{},

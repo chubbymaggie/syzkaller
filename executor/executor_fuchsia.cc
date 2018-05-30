@@ -12,7 +12,7 @@
 
 #include "syscalls_fuchsia.h"
 
-uint32_t output;
+uint32 output;
 
 int main(int argc, char** argv)
 {
@@ -20,6 +20,9 @@ int main(int argc, char** argv)
 		puts(GOOS " " GOARCH " " SYZ_REVISION " " GIT_REVISION);
 		return 0;
 	}
+
+	if (syz_mmap(SYZ_DATA_OFFSET, SYZ_NUM_PAGES * SYZ_PAGE_SIZE) != ZX_OK)
+		fail("mmap of data segment failed");
 
 	install_segv_handler();
 	setup_control_pipes();
@@ -48,17 +51,27 @@ void cover_reset(thread_t* th)
 {
 }
 
-uint64_t read_cover_size(thread_t* th)
+uint32 read_cover_size(thread_t* th)
 {
 	return 0;
 }
 
-uint32_t* write_output(uint32_t v)
+bool cover_check(uint32 pc)
+{
+	return true;
+}
+
+bool cover_check(uint64 pc)
+{
+	return true;
+}
+
+uint32* write_output(uint32 v)
 {
 	return &output;
 }
 
-void write_completed(uint32_t completed)
+void write_completed(uint32 completed)
 {
 }
 

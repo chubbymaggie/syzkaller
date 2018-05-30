@@ -1,7 +1,25 @@
 # Found bugs
 
-_newer first_
+Latest bugs are most reported by [syzbot](/docs/syzbot.md) and are listed [here](https://groups.google.com/forum/#!forum/syzkaller-bugs). Additional USB bugs are [here](/docs/linux/found_bugs_usb.md).
 
+_newer first_
+* [RDMA/mlx5: Fix NULL dereference while accessing XRC_TGT QPslogin ](https://patchwork.kernel.org/patch/10274675/)
+* [KASAN: use-after-free Read in set_page_dirty_lock](https://groups.google.com/forum/#!topic/syzkaller/w-u4MXthFoI)
+* [System freeze and NULL pointer dereference](https://groups.google.com/d/msg/syzkaller-bugs/LxPlUEk62IA/OIfFWHr_AgAJ)
+* [RDS: WARNING in rds_recv_hs_exthdrs](https://groups.google.com/d/msg/syzkaller/TTR-hlzVO1I/T7ncQ3xjAQAJ)
+* [RDS: slab-out-of-bounds Read in rds_rdma_extra_size](https://groups.google.com/d/msg/syzkaller/VxPgmfL9H8k/PJxhMJZiAQAJ)
+* [netfilter: fix out-of-bounds accesses in clusterip_tg_check()](https://groups.google.com/d/msg/syzkaller/uyndMVk770k/TXIlWssrAwAJ)
+* [net: hang in unregister_netdevice: waiting for lo to become free](https://groups.google.com/d/msg/syzkaller/-06_laheMF0/xqezy58kAwAJ)
+* [scsi: sg: assorted memory corruptions](https://groups.google.com/d/msg/syzkaller/9RNr9Gu0MyY/Yyry-0XBDgAJ)
+* [kcm: memory leak in kcm_sendmsg](https://groups.google.com/d/msg/syzkaller/3wdPAXqqABY/i-OgV10gDwAJ)
+* [AF_KEY: memory leak in key_notify_policy](https://groups.google.com/d/msg/syzkaller/j6H7dPEQv-s/A-ADSd8gDwAJ)
+* [sctp: memory leak in sctp_endpoint_init](https://groups.google.com/d/msg/syzkaller/rz5CvX4rTFA/PUCYbwEiDwAJ)
+* [tipc: memory leak in tipc_nl_node_get_link](https://groups.google.com/d/msg/syzkaller/6nCOXX58sKw/J91ioe4iDwAJ)
+* [tun: memory leak in tun_set_iff](https://groups.google.com/d/msg/syzkaller/ZuubuAQpne0/sSjnZfojDwAJ)
+* [net/8021q: memory leak in register_vlan_dev](https://groups.google.com/d/msg/syzkaller/bFkAaOcP-SI/9MSok8IlDwAJ)
+* [net: memory leak in socket](https://groups.google.com/d/msg/syzkaller/DMV3fSoKyR0/biGHOQQlDwAJ)
+* [scsi: memory leak in sg_start_req](https://groups.google.com/d/msg/syzkaller/GVR3rFTzQzo/kGvdqZgcDwAJ)
+* [sunrpc: infinite unkillable console spam in xs_tcp_setup_socket](https://groups.google.com/d/msg/syzkaller/DJmtkqwLCZg/mHJPAJHTAQAJ)
 * [fs: possible deadlock in do_iter_write/do_splice](https://groups.google.com/forum/#!topic/syzkaller/f72L3fPD8sY)
 * [net/ipv6: warning in __alloc_pages_slowpath/ipip6_tunnel_get_prl](https://groups.google.com/forum/#!topic/syzkaller/VtONA6oTiio)
 * [net/ipv6: GPF in rt6_ifdown](https://groups.google.com/forum/#!topic/syzkaller/dQ0r_bHOrJk)

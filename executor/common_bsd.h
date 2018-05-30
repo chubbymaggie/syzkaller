@@ -51,13 +51,11 @@ static void segv_handler(int sig, siginfo_t* info, void* uctx)
 	const uintptr_t prog_start = 1 << 20;
 	const uintptr_t prog_end = 100 << 20;
 	if (__atomic_load_n(&skip_segv, __ATOMIC_RELAXED) && (addr < prog_start || addr > prog_end)) {
-		debug("SIGSEGV on %p, skipping\n", addr);
+		debug("SIGSEGV on %p, skipping\n", (void*)addr);
 		_longjmp(segv_env, 1);
 	}
-	debug("SIGSEGV on %p, exiting\n", addr);
+	debug("SIGSEGV on %p, exiting\n", (void*)addr);
 	doexit(sig);
-	for (;;) {
-	}
 }
 
 static void install_segv_handler()
@@ -82,18 +80,18 @@ static void install_segv_handler()
 #endif
 
 #if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT))
-static uint64_t current_time_ms()
+static uint64 current_time_ms()
 {
 	struct timespec ts;
 
 	if (clock_gettime(CLOCK_MONOTONIC, &ts))
 		fail("clock_gettime failed");
-	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+	return (uint64)ts.tv_sec * 1000 + (uint64)ts.tv_nsec / 1000000;
 }
 #endif
 
 #if defined(SYZ_EXECUTOR)
-static void sleep_ms(uint64_t ms)
+static void sleep_ms(uint64 ms)
 {
 	usleep(ms * 1000);
 }

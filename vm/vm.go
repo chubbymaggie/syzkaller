@@ -18,6 +18,7 @@ import (
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/vm/vmimpl"
 
+	// Import all VM implementations, so that users only need to import vm.
 	_ "github.com/google/syzkaller/vm/adb"
 	_ "github.com/google/syzkaller/vm/gce"
 	_ "github.com/google/syzkaller/vm/isolated"
@@ -41,8 +42,12 @@ type Env vmimpl.Env
 
 var (
 	Shutdown   = vmimpl.Shutdown
-	TimeoutErr = vmimpl.TimeoutErr
+	ErrTimeout = vmimpl.ErrTimeout
 )
+
+type BootErrorer interface {
+	BootError() (string, []byte)
+}
 
 func Create(typ string, env *Env) (*Pool, error) {
 	impl, err := vmimpl.Create(typ, (*vmimpl.Env)(env))
@@ -87,7 +92,8 @@ func (inst *Instance) Forward(port int) (string, error) {
 	return inst.impl.Forward(port)
 }
 
-func (inst *Instance) Run(timeout time.Duration, stop <-chan bool, command string) (outc <-chan []byte, errc <-chan error, err error) {
+func (inst *Instance) Run(timeout time.Duration, stop <-chan bool, command string) (
+	outc <-chan []byte, errc <-chan error, err error) {
 	return inst.impl.Run(timeout, stop, command)
 }
 
@@ -96,14 +102,16 @@ func (inst *Instance) Close() {
 	os.RemoveAll(inst.workdir)
 }
 
-func MonitorExecution(outc <-chan []byte, errc <-chan error, needOutput bool,
-	reporter report.Reporter) (desc string, text, output []byte, crashed, timedout bool) {
+// MonitorExecution monitors execution of a program running inside of a VM.
+// It detects kernel oopses in output, lost connections, hangs, etc.
+// outc/errc is what vm.Instance.Run returns, reporter parses kernel output for oopses.
+// If canExit is false and the program exits, it is treated as an error.
+// Returns a non-symbolized crash report, or nil if no error happens.
+func MonitorExecution(outc <-chan []byte, errc <-chan error, reporter report.Reporter, canExit bool) (
+	rep *report.Report) {
+	var output []byte
 	waitForOutput := func() {
-		dur := time.Second
-		if needOutput {
-			dur = 10 * time.Second
-		}
-		timer := time.NewTimer(dur).C
+		timer := time.NewTimer(10 * time.Second).C
 		for {
 			select {
 			case out, ok := <-outc:
@@ -122,25 +130,41 @@ func MonitorExecution(outc <-chan []byte, errc <-chan error, needOutput bool,
 		beforeContext = 1024 << 10
 		afterContext  = 128 << 10
 	)
-	extractError := func(defaultError string) (string, []byte, []byte, bool, bool) {
+	extractError := func(defaultError string) *report.Report {
 		// Give it some time to finish writing the error message.
 		waitForOutput()
 		if bytes.Contains(output, []byte("SYZ-FUZZER: PREEMPTED")) {
-			return "preempted", nil, nil, false, true
+			return nil
 		}
 		if !reporter.ContainsCrash(output[matchPos:]) {
-			return defaultError, nil, output, defaultError != "", false
+			if defaultError == "" {
+				if canExit {
+					return nil
+				}
+				defaultError = "lost connection to test machine"
+			}
+			rep := &report.Report{
+				Title:  defaultError,
+				Output: output,
+			}
+			return rep
 		}
-		desc, text, start, end := reporter.Parse(output[matchPos:])
-		start = start + matchPos - beforeContext
+		rep := reporter.Parse(output[matchPos:])
+		if rep == nil {
+			panic(fmt.Sprintf("reporter.ContainsCrash/Parse disagree:\n%s", output[matchPos:]))
+		}
+		start := matchPos + rep.StartPos - beforeContext
 		if start < 0 {
 			start = 0
 		}
-		end = end + matchPos + afterContext
+		end := matchPos + rep.EndPos + afterContext
 		if end > len(output) {
 			end = len(output)
 		}
-		return desc, text, output[start:end], true, false
+		rep.Output = output[start:end]
+		rep.StartPos += matchPos - start
+		rep.EndPos += matchPos - start
+		return rep
 	}
 
 	lastExecuteTime := time.Now()
@@ -159,8 +183,8 @@ func MonitorExecution(outc <-chan []byte, errc <-chan error, needOutput bool,
 				// The program has exited without errors,
 				// but wait for kernel output in case there is some delayed oops.
 				return extractError("")
-			case TimeoutErr:
-				return err.Error(), nil, nil, false, true
+			case ErrTimeout:
+				return nil
 			default:
 				// Note: connection lost can race with a kernel oops message.
 				// In such case we want to return the kernel oops.
@@ -168,10 +192,12 @@ func MonitorExecution(outc <-chan []byte, errc <-chan error, needOutput bool,
 			}
 		case out := <-outc:
 			output = append(output, out...)
-			if bytes.Index(output[matchPos:], []byte("executing program")) != -1 { // syz-fuzzer output
+			// syz-fuzzer output
+			if bytes.Contains(output[matchPos:], []byte("executing program")) {
 				lastExecuteTime = time.Now()
 			}
-			if bytes.Index(output[matchPos:], []byte("executed programs:")) != -1 { // syz-execprog output
+			// syz-execprog output
+			if bytes.Contains(output[matchPos:], []byte("executed programs:")) {
 				lastExecuteTime = time.Now()
 			}
 			if reporter.ContainsCrash(output[matchPos:]) {
@@ -181,20 +207,30 @@ func MonitorExecution(outc <-chan []byte, errc <-chan error, needOutput bool,
 				copy(output, output[len(output)-beforeContext:])
 				output = output[:beforeContext]
 			}
-			matchPos = len(output) - 128
+			matchPos = len(output) - 512
 			if matchPos < 0 {
 				matchPos = 0
 			}
-			// In some cases kernel constantly prints something to console,
+			// In some cases kernel episodically prints something to console,
 			// but fuzzer is not actually executing programs.
+			// We intentionally produce the same title as no output at all,
+			// because frequently it's the same condition.
 			if time.Since(lastExecuteTime) > 3*time.Minute {
-				return "test machine is not executing programs", nil, output, true, false
+				rep := &report.Report{
+					Title:  "no output from test machine",
+					Output: output,
+				}
+				return rep
 			}
 		case <-ticker.C:
 			tickerFired = true
-			return "no output from test machine", nil, output, true, false
+			rep := &report.Report{
+				Title:  "no output from test machine",
+				Output: output,
+			}
+			return rep
 		case <-Shutdown:
-			return "", nil, nil, false, false
+			return nil
 		}
 	}
 }

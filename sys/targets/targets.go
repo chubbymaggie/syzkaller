@@ -8,6 +8,9 @@ type Target struct {
 	OS                 string
 	Arch               string
 	PtrSize            uint64
+	PageSize           uint64
+	NumPages           uint64
+	DataOffset         uint64
 	CArch              []string
 	CFlags             []string
 	CrossCFlags        []string
@@ -32,9 +35,20 @@ type os struct {
 }
 
 var List = map[string]map[string]*Target{
+	"test": map[string]*Target{
+		"32": {
+			PtrSize:  4,
+			PageSize: 8 << 10,
+		},
+		"64": {
+			PtrSize:  8,
+			PageSize: 4 << 10,
+		},
+	},
 	"linux": map[string]*Target{
 		"amd64": {
 			PtrSize:          8,
+			PageSize:         4 << 10,
 			CArch:            []string{"__x86_64__"},
 			CFlags:           []string{"-m64"},
 			CrossCFlags:      []string{"-m64"},
@@ -49,6 +63,7 @@ var List = map[string]map[string]*Target{
 		},
 		"386": {
 			PtrSize:          4,
+			PageSize:         4 << 10,
 			CArch:            []string{"__i386__"},
 			CFlags:           []string{"-m32"},
 			CrossCFlags:      []string{"-m32"},
@@ -58,6 +73,7 @@ var List = map[string]map[string]*Target{
 		},
 		"arm64": {
 			PtrSize:          8,
+			PageSize:         4 << 10,
 			CArch:            []string{"__aarch64__"},
 			CCompilerPrefix:  "aarch64-linux-gnu-",
 			KernelArch:       "arm64",
@@ -65,8 +81,9 @@ var List = map[string]map[string]*Target{
 		},
 		"arm": {
 			PtrSize:          4,
+			PageSize:         4 << 10,
 			CArch:            []string{"__arm__"},
-			CFlags:           []string{"-D__LINUX_ARM_ARCH__=6", "-m32"},
+			CFlags:           []string{"-D__LINUX_ARM_ARCH__=6", "-m32", "-D__ARM_EABI__"},
 			CrossCFlags:      []string{"-D__LINUX_ARM_ARCH__=6", "-march=armv6t2"},
 			CCompilerPrefix:  "arm-linux-gnueabihf-",
 			KernelArch:       "arm",
@@ -74,6 +91,7 @@ var List = map[string]map[string]*Target{
 		},
 		"ppc64le": {
 			PtrSize:          8,
+			PageSize:         4 << 10,
 			CArch:            []string{"__ppc64__", "__PPC64__", "__powerpc64__"},
 			CFlags:           []string{"-D__powerpc64__"},
 			CrossCFlags:      []string{"-D__powerpc64__"},
@@ -84,37 +102,46 @@ var List = map[string]map[string]*Target{
 	},
 	"freebsd": map[string]*Target{
 		"amd64": {
-			PtrSize: 8,
-			CArch:   []string{"__x86_64__"},
-			CFlags:  []string{"-m64"},
+			PtrSize:  8,
+			PageSize: 4 << 10,
+			CArch:    []string{"__x86_64__"},
+			CFlags:   []string{"-m64"},
 		},
 	},
 	"netbsd": map[string]*Target{
 		"amd64": {
-			PtrSize: 8,
-			CArch:   []string{"__x86_64__"},
-			CFlags:  []string{"-m64"},
+			PtrSize:  8,
+			PageSize: 4 << 10,
+			CArch:    []string{"__x86_64__"},
+			CFlags:   []string{"-m64"},
 		},
 	},
 	"fuchsia": map[string]*Target{
 		"amd64": {
-			PtrSize: 8,
-			CArch:   []string{"__x86_64__"},
+			PtrSize:          8,
+			PageSize:         4 << 10,
+			CArch:            []string{"__x86_64__"},
+			KernelHeaderArch: "x64",
 		},
 		"arm64": {
-			PtrSize: 8,
-			CArch:   []string{"__aarch64__"},
+			PtrSize:          8,
+			PageSize:         4 << 10,
+			CArch:            []string{"__aarch64__"},
+			KernelHeaderArch: "arm64",
 		},
 	},
 	"windows": map[string]*Target{
 		"amd64": {
 			PtrSize: 8,
-			CArch:   []string{"_M_X64"},
+			// TODO(dvyukov): what should we do about 4k vs 64k?
+			PageSize: 4 << 10,
+			CArch:    []string{"_M_X64"},
 		},
 	},
 	"akaros": map[string]*Target{
 		"amd64": {
 			PtrSize:           8,
+			PageSize:          4 << 10,
 			CArch:             []string{"__x86_64__"},
 			NeedSyscallDefine: dontNeedSyscallDefine,
 		},
@@ -167,6 +194,8 @@ func init() {
 			if target.NeedSyscallDefine == nil {
 				target.NeedSyscallDefine = needSyscallDefine
 			}
+			target.DataOffset = 512 << 20
+			target.NumPages = (16 << 20) / target.PageSize
 		}
 	}
 }

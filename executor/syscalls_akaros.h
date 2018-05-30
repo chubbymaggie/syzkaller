@@ -2,8 +2,10 @@
 
 #if defined(__x86_64__) || 0
 #define GOARCH "amd64"
-#define SYZ_REVISION "1caab53009bda97952c0c670cb9fc3e335e1d49d"
-
+#define SYZ_REVISION "b3ec742aa8b8f4d014d4030760d098325dfb1f62"
+#define SYZ_PAGE_SIZE 4096
+#define SYZ_NUM_PAGES 4096
+#define SYZ_DATA_OFFSET 536870912
 unsigned syscall_count = 35;
 call_t syscalls[] = {
     {"abort_sysc_fd", 33},

@@ -5,16 +5,21 @@
 // between various parts of the system.
 package rpctype
 
-type RpcInput struct {
+import (
+	"github.com/google/syzkaller/pkg/signal"
+)
+
+type RPCInput struct {
 	Call   string
 	Prog   []byte
-	Signal []uint32
+	Signal signal.Serial
 	Cover  []uint32
 }
 
-type RpcCandidate struct {
+type RPCCandidate struct {
 	Prog      []byte
 	Minimized bool
+	Smashed   bool
 }
 
 type ConnectArgs struct {
@@ -23,10 +28,10 @@ type ConnectArgs struct {
 
 type ConnectRes struct {
 	Prios        [][]float32
-	Inputs       []RpcInput
-	MaxSignal    []uint32
-	Candidates   []RpcCandidate
-	EnabledCalls string
+	Inputs       []RPCInput
+	MaxSignal    signal.Serial
+	Candidates   []RPCCandidate
+	EnabledCalls []int
 	NeedCheck    bool
 }
 
@@ -38,6 +43,7 @@ type CheckArgs struct {
 	UserNamespaces bool
 	CompsSupported bool
 	Calls          []string
+	DisabledCalls  []SyscallReason
 	FuzzerGitRev   string
 	FuzzerSyzRev   string
 	ExecutorGitRev string
@@ -45,22 +51,27 @@ type CheckArgs struct {
 	ExecutorArch   string
 }
 
+type SyscallReason struct {
+	Name   string
+	Reason string
+}
+
 type NewInputArgs struct {
 	Name string
-	RpcInput
+	RPCInput
 }
 
 type PollArgs struct {
 	Name           string
 	NeedCandidates bool
-	MaxSignal      []uint32
+	MaxSignal      signal.Serial
 	Stats          map[string]uint64
 }
 
 type PollRes struct {
-	Candidates []RpcCandidate
-	NewInputs  []RpcInput
-	MaxSignal  []uint32
+	Candidates []RPCCandidate
+	NewInputs  []RPCInput
+	MaxSignal  signal.Serial
 }
 
 type HubConnectArgs struct {

@@ -140,11 +140,6 @@ func (target *Target) calcDynamicPrio(corpus []*Prog) [][]float32 {
 			for _, c1 := range p.Calls {
 				id0 := c0.Meta.ID
 				id1 := c1.Meta.ID
-				// There are too many mmap's anyway.
-				if id0 == id1 || c0.Meta == target.MmapSyscall ||
-					c1.Meta == target.MmapSyscall {
-					continue
-				}
 				prios[id0][id1] += 1.0
 			}
 		}
@@ -220,7 +215,11 @@ func (target *Target) BuildChoiceTable(prios [][]float32, enabled map[*Syscall]b
 		sum := 0
 		for j := range run[i] {
 			if enabled[target.Syscalls[j]] {
-				sum += int(prios[i][j] * 1000)
+				w := 1
+				if prios != nil {
+					w = int(prios[i][j] * 1000)
+				}
+				sum += w
 			}
 			run[i][j] = sum
 		}
@@ -237,11 +236,10 @@ func (ct *ChoiceTable) Choose(r *rand.Rand, call int) int {
 		return ct.enabledCalls[r.Intn(len(ct.enabledCalls))].ID
 	}
 	for {
-		x := r.Intn(run[len(run)-1])
+		x := r.Intn(run[len(run)-1]) + 1
 		i := sort.SearchInts(run, x)
-		if !ct.enabled[ct.target.Syscalls[i]] {
-			continue
+		if ct.enabled[ct.target.Syscalls[i]] {
+			return i
 		}
-		return i
 	}
 }

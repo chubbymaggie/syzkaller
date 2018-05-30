@@ -6,11 +6,15 @@ invocation time with the `-config` option.  This configuration can be based on t
 following keys in its top-level object:
 
  - `http`: URL that will display information about the running `syz-manager` process.
+ - `email_addrs`: Optional list of email addresses to receive notifications when bugs are encountered for the first time.
+   Mailx is the only supported mailer. Please set it up prior to using this function.
  - `workdir`: Location of a working directory for the `syz-manager` process. Outputs here include:
      - `<workdir>/crashes/*`: crash output files (see [Crash Reports](#crash-reports))
      - `<workdir>/corpus.db`: corpus with interesting programs
      - `<workdir>/instance-x`: per VM instance temporary files
- - `syzkaller`: Location of the `syzkaller` checkout.
+ - `syzkaller`: Location of the `syzkaller` checkout, `syz-manager` will look
+   for binaries in `bin` subdir (does not have to be `syzkaller` checkout as
+   long as it preserves `bin` dir structure)
  - `vmlinux`: Location of the `vmlinux` file that corresponds to the kernel being tested
    (used for report symbolization and coverage reports, optional).
  - `procs`: Number of parallel test processes in each VM (4 or 8 would be a reasonable number).

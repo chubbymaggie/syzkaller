@@ -21,17 +21,29 @@
 #define __syscall syscall
 #endif
 
+#include <fcntl.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <sys/types.h>
 
+#if defined(__FreeBSD__)
+#define KIOENABLE _IOW('c', 2, int) // Enable coverage recording
+#define KIODISABLE _IO('c', 3) // Disable coverage recording
+#define KIOSETBUFSIZE _IOW('c', 4, unsigned int) // Set the buffer size
+
+#define KCOV_MODE_NONE -1
+#define KCOV_MODE_TRACE_PC 0
+#define KCOV_MODE_TRACE_CMP 1
+#endif
+
 const int kInFd = 3;
 const int kOutFd = 4;
 
-uint32_t* output_data;
-uint32_t* output_pos;
+uint32* output_data;
+uint32* output_pos;
 
 int main(int argc, char** argv)
 {
@@ -47,9 +59,12 @@ int main(int argc, char** argv)
 	// But fuzzer constantly invents new ways of how to currupt the region,
 	// so we map the region at a (hopefully) hard to guess address surrounded by unmapped pages.
 	void* const kOutputDataAddr = (void*)0x1ddbc20000;
-	output_data = (uint32_t*)mmap(kOutputDataAddr, kMaxOutput, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, kOutFd, 0);
+	output_data = (uint32*)mmap(kOutputDataAddr, kMaxOutput, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, kOutFd, 0);
 	if (output_data != kOutputDataAddr)
 		fail("mmap of output file failed");
+	if (mmap((void*)SYZ_DATA_OFFSET, SYZ_NUM_PAGES * SYZ_PAGE_SIZE, PROT_READ | PROT_WRITE,
+		 MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) != (void*)SYZ_DATA_OFFSET)
+		fail("mmap of data segment failed");
 	// Prevent random programs to mess with these fds.
 	// Due to races in collider mode, a program can e.g. ftruncate one of these fds,
 	// which will cause fuzzer to crash.
@@ -97,16 +112,16 @@ int main(int argc, char** argv)
 			doexit(0);
 		}
 		int status = 0;
-		uint64_t start = current_time_ms();
-		uint64_t last_executed = start;
-		uint32_t executed_calls = __atomic_load_n(output_data, __ATOMIC_RELAXED);
+		uint64 start = current_time_ms();
+		uint64 last_executed = start;
+		uint32 executed_calls = __atomic_load_n(output_data, __ATOMIC_RELAXED);
 		for (;;) {
 			int res = waitpid(pid, &status, WNOHANG);
 			if (res == pid)
 				break;
 			sleep_ms(1);
-			uint64_t now = current_time_ms();
-			uint32_t now_executed = __atomic_load_n(output_data, __ATOMIC_RELAXED);
+			uint64 now = current_time_ms();
+			uint32 now_executed = __atomic_load_n(output_data, __ATOMIC_RELAXED);
 			if (executed_calls != now_executed) {
 				executed_calls = now_executed;
 				last_executed = now;
@@ -142,30 +157,80 @@ void cover_open()
 		return;
 	for (int i = 0; i < kMaxThreads; i++) {
 		thread_t* th = &threads[i];
-		th->cover_data = &th->cover_buffer[0];
+#if defined(__FreeBSD__)
+		th->cover_fd = open("/dev/kcov", O_RDWR);
+		if (th->cover_fd == -1)
+			fail("open of /dev/kcov failed");
+		if (ioctl(th->cover_fd, KIOSETBUFSIZE, &kCoverSize))
+			fail("ioctl init trace write failed");
+		size_t mmap_alloc_size = kCoverSize * (is_kernel_64_bit ? 8 : 4);
+		char* mmap_ptr = (char*)mmap(NULL, mmap_alloc_size,
+					     PROT_READ | PROT_WRITE,
+					     MAP_SHARED, th->cover_fd, 0);
+		if (mmap_ptr == NULL)
+			fail("cover mmap failed");
+		th->cover_data = mmap_ptr;
+		th->cover_end = mmap_ptr + mmap_alloc_size;
+#else
+		th->cover_data = (char*)&th->cover_buffer[0];
+		th->cover_end = th->cover_data + sizeof(th->cover_buffer);
+#endif
 	}
 }
 
 void cover_enable(thread_t* th)
 {
+#if defined(__FreeBSD__)
+	if (!flag_cover)
+		return;
+	debug("#%d: enabling /dev/kcov\n", th->id);
+	int kcov_mode = flag_collect_comps ? KCOV_MODE_TRACE_CMP : KCOV_MODE_TRACE_PC;
+	if (ioctl(th->cover_fd, KIOENABLE, &kcov_mode))
+		exitf("cover enable write trace failed, mode=%d", kcov_mode);
+	debug("#%d: enabled /dev/kcov\n", th->id);
+#endif
 }
 
 void cover_reset(thread_t* th)
 {
+#if defined(__FreeBSD__)
+	if (!flag_cover)
+		return;
+
+	*th->cover_size_ptr = 0;
+#endif
 }
 
-uint64_t read_cover_size(thread_t* th)
+uint32 read_cover_size(thread_t* th)
 {
 	if (!flag_cover)
 		return 0;
+#if defined(__FreeBSD__)
+	uint64 size = *th->cover_size_ptr;
+	debug("#%d: read cover size = %llu\n", th->id, size);
+	if (size > kCoverSize)
+		fail("#%d: too much cover %llu", th->id, size);
+	return size;
+#else
 	// Fallback coverage since we have no real coverage available.
 	// We use syscall number or-ed with returned errno value as signal.
 	// At least this gives us all combinations of syscall+errno.
 	th->cover_data[0] = (th->call_num << 16) | ((th->res == -1 ? th->reserrno : 0) & 0x3ff);
 	return 1;
+#endif
 }
 
-uint32_t* write_output(uint32_t v)
+bool cover_check(uint32 pc)
+{
+	return true;
+}
+
+bool cover_check(uint64 pc)
+{
+	return true;
+}
+
+uint32* write_output(uint32 v)
 {
 	if (collide)
 		return 0;
@@ -175,7 +240,7 @@ uint32_t* write_output(uint32_t v)
 	return output_pos++;
 }
 
-void write_completed(uint32_t completed)
+void write_completed(uint32 completed)
 {
 	__atomic_store_n(output_data, completed, __ATOMIC_RELEASE);
 }

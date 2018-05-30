@@ -2,14 +2,21 @@
 
 Prerequisites:
  - go1.8+ toolchain (can be downloaded from [here](https://golang.org/dl/))
- - Android NDK (tested with r15 on API24) (can be downloaded from [here](https://developer.android.com/ndk/downloads/index.html))
-     + Set the `$NDK` environment variable to point at it
  - Android Serial Cable or [Suzy-Q](https://chromium.googlesource.com/chromiumos/platform/ec/+/master/docs/case_closed_debugging.md) device to capture console output is preferable but optional. syzkaller can work with normal USB cable as well, but that can be somewhat unreliable and turn lots of crashes into "lost connection to test machine" crashes with no additional info.
 
  - Build syzkaller
 
+In case you have old Android `/dev/ion` driver:
+
 ```sh
-$ NDK=/path/to/android/ndk make TARGETOS=android TARGETARCH=arm64
+cp sys/android/* sys/linux
+make generate
+```
+
+Then:
+
+```sh
+make TARGETOS=linux TARGETARCH=arm64
 ```
 
  - Create config with `"type": "adb"` and specify adb devices to use. For example:
@@ -31,4 +38,4 @@ $ NDK=/path/to/android/ndk make TARGETOS=android TARGETARCH=arm64
  - Start `syz-manager -config adb.cfg` as usual.
 
 If you get issues after `syz-manager` starts, consider running it with the `-debug` flag.
-Also see [this page](/docs/troubleshooting.md) for troubleshooting tips and [Building a Pixel kernel with KASAN+KCOV](https://source.android.com/devices/tech/debug/kasan-kcov) for kernel build/boot instructions.
+Also see [this page](/docs/troubleshooting.md) for troubleshooting tips and [Building a Pixel kernel with KASAN+KCOV](https://source.android.com/devices/tech/debug/kasan-kcov) or [Building a PH-1 kernel with KASAN+KCOV](https://github.com/EssentialOpenSource/kernel-manifest/blob/master/README.md) for kernel build/boot instructions.
